@@ -1,0 +1,9 @@
+venv
+.vscode
+*.log
+*.spdx
+*.json
+*.pyc
+*.html
+*.zip
+test.bat
