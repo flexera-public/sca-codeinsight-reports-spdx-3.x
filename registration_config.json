@@ -1,0 +1,26 @@
+{
+    "reportName" : "SBOM Report - SPDX 3.0.1",
+    "enableProjectPickerValue" : "false",
+    "reportOptions" : {
+        "option1" : 
+        {
+            "name" : "includeChildProjects",
+            "label" : "Include child project data? (True/False)",
+            "description" : "Should the report include data from child projects? <b>(True/False)</b>",
+            "type" : "string",
+            "defaultValue" : "True",
+            "required" : "true",
+            "order" : "1"
+        },
+        "option2" :  
+        {
+            "name" : "creatorName",
+            "label" : "Creator Name",
+            "description" : "The name of the organization that created the SPDX document. Default is 'OrganizationName'.",
+            "type" : "string",
+            "defaultValue" : "OrganizationName",
+            "required" : "true",
+            "order" : "2"
+        }
+    }
+}
