@@ -10,7 +10,7 @@ Modified On: Oct Mon 07 2025
 File : report_data.py
 '''
 
-import logging, unicodedata, uuid, hashlib, datetime
+import logging, unicodedata, uuid, hashlib, datetime, re
 import report_data_db
 import SPDX_license_mappings
 
@@ -292,6 +292,238 @@ def gather_data_for_report(projectID, reportData):
             if inventoryLink not in added_spdx_ids:
                 reportDetails["@graph"].append(package_node)
                 added_spdx_ids.add(inventoryLink)
+
+            # Process package-level licenses (declared licenses from component)
+            componentId = inventoryItem.get("componentId")
+            if componentId is not None:
+                possibleLicenses = report_data_db.get_component_possible_Licenses(componentId)
+                if possibleLicenses is not None and isinstance(possibleLicenses, list):
+                    for license in possibleLicenses:
+                        licenseName = license.get("licenseName")
+                        
+                        # Determine possibleLicenseSPDXIdentifier based on available fields
+                        if license.get("spdxIdentifier") is None and license.get("shortName") != "" and license.get("shortName") is not None:
+                            possibleLicenseSPDXIdentifier = license["shortName"]
+                        elif license.get("spdxIdentifier") is not None:
+                            possibleLicenseSPDXIdentifier = license["spdxIdentifier"]
+                        else:
+                            possibleLicenseSPDXIdentifier = licenseName
+                        
+                        # Handle Public Domain as NONE
+                        if licenseName == "Public Domain":
+                            logger.info("        Added to NONE declaredLicenses since Public Domain.")
+                            license_spdx_id = f"{namespaceMap}{projectID}-NONE"
+                            if license_spdx_id not in added_spdx_ids:
+                                none_license_node = {
+                                    "spdxId": license_spdx_id,
+                                    "type": "simplelicensing_LicenseExpression",
+                                    "simplelicensing_licenseExpression": "NONE",
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(none_license_node)
+                                added_spdx_ids.add(license_spdx_id)
+                            
+                            # Create relationship
+                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-NONE-{inventoryID}"
+                            if license_rel_spdx_id not in added_spdx_ids:
+                                license_relationship_node = {
+                                    "spdxId": license_rel_spdx_id,
+                                    "type": "Relationship",
+                                    "relationshipType": "hasConcludedLicense",
+                                    "from": inventoryLink,
+                                    "to": [license_spdx_id],
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(license_relationship_node)
+                                added_spdx_ids.add(license_rel_spdx_id)
+                        
+                        # Check if license is in SPDX mappings
+                        elif possibleLicenseSPDXIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
+                            logger.info("        \"%s\" maps to SPDX ID: \"%s\"" % (possibleLicenseSPDXIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]))
+                            spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]
+                            license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
+                            
+                            if license_spdx_id not in added_spdx_ids:
+                                license_node = {
+                                    "spdxId": license_spdx_id,
+                                    "type": "simplelicensing_LicenseExpression",
+                                    "simplelicensing_licenseExpression": spdx_mapped_license,
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(license_node)
+                                added_spdx_ids.add(license_spdx_id)
+                            
+                            # Create relationship
+                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{spdx_mapped_license}-{inventoryID}"
+                            if license_rel_spdx_id not in added_spdx_ids:
+                                license_relationship_node = {
+                                    "spdxId": license_rel_spdx_id,
+                                    "type": "Relationship",
+                                    "relationshipType": "hasConcludedLicense",
+                                    "from": inventoryLink,
+                                    "to": [license_spdx_id],
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(license_relationship_node)
+                                added_spdx_ids.add(license_rel_spdx_id)
+                        
+                        else:
+                            # License not in SPDX mappings - create CustomLicense with LicenseRef
+                            logger.warning("        \"%s\" is not a valid SPDX identifier for Declared License. - Using LicenseRef." % (possibleLicenseSPDXIdentifier))
+                            
+                            # Clean up the identifier
+                            possibleLicenseSPDXIdentifier = possibleLicenseSPDXIdentifier.split("(", 1)[0].rstrip()  # Remove everything after (
+                            possibleLicenseSPDXIdentifier = re.sub('[^a-zA-Z0-9 \n\.]', '-', possibleLicenseSPDXIdentifier)  # Replace special chars with dash
+                            possibleLicenseSPDXIdentifier = possibleLicenseSPDXIdentifier.replace(" ", "-")  # Replace space with dash
+                            licenseReference = "LicenseRef-%s" % possibleLicenseSPDXIdentifier
+                            
+                            # Priority: noticeText > asFoundLicenseText > possibleLicenseSPDXIdentifier
+                            extractedText = (inventoryItem.get("noticeText") or 
+                                           inventoryItem.get("asFoundLicenseText") or 
+                                           possibleLicenseSPDXIdentifier)
+                            
+                            custom_license_spdx_id = f"{namespaceMap}{licenseReference}"
+                            
+                            # Create CustomLicense element (SPDX 3.x equivalent of hasExtractedLicensingInfos)
+                            if custom_license_spdx_id not in added_spdx_ids:
+                                custom_license_node = {
+                                    "spdxId": custom_license_spdx_id,
+                                    "type": "expandedlicensing_CustomLicense",
+                                    "simplelicensing_licenseText": extractedText,
+                                    "name": possibleLicenseSPDXIdentifier,
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(custom_license_node)
+                                added_spdx_ids.add(custom_license_spdx_id)
+                            
+                            # Create relationship between package and custom license
+                            custom_license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{licenseReference}-{inventoryID}"
+                            if custom_license_rel_spdx_id not in added_spdx_ids:
+                                custom_license_relationship_node = {
+                                    "spdxId": custom_license_rel_spdx_id,
+                                    "type": "Relationship",
+                                    "relationshipType": "hasConcludedLicense",
+                                    "from": inventoryLink,
+                                    "to": [custom_license_spdx_id],
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(custom_license_relationship_node)
+                                added_spdx_ids.add(custom_license_rel_spdx_id)
+
+            # Process inventory-specific selected license (the license chosen for this specific inventory item)
+            selectedLicenseName = inventoryItem.get("selectedLicenseName")
+            selectedLicenseSPDXIdentifier = inventoryItem.get("selectedLicenseSPDXIdentifier")
+            shortName = inventoryItem.get("shortName")
+            
+            if selectedLicenseName is not None and selectedLicenseName != "":
+                # Determine the SPDX identifier to use
+                if selectedLicenseSPDXIdentifier is not None and selectedLicenseSPDXIdentifier != "":
+                    selectedIdentifier = selectedLicenseSPDXIdentifier
+                elif shortName is not None and shortName != "":
+                    selectedIdentifier = shortName
+                else:
+                    selectedIdentifier = selectedLicenseName
+                
+                # Handle Public Domain as NONE
+                if selectedLicenseName == "Public Domain":
+                    logger.info("        Added to NONE concludedLicense for selected license since Public Domain.")
+                    license_spdx_id = f"{namespaceMap}{projectID}-NONE"
+                    if license_spdx_id not in added_spdx_ids:
+                        none_license_node = {
+                            "spdxId": license_spdx_id,
+                            "type": "simplelicensing_LicenseExpression",
+                            "simplelicensing_licenseExpression": "NONE",
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(none_license_node)
+                        added_spdx_ids.add(license_spdx_id)
+                    
+                    # Create relationship
+                    license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-NONE-selected-{inventoryID}"
+                    if license_rel_spdx_id not in added_spdx_ids:
+                        license_relationship_node = {
+                            "spdxId": license_rel_spdx_id,
+                            "type": "Relationship",
+                            "relationshipType": "hasConcludedLicense",
+                            "from": inventoryLink,
+                            "to": [license_spdx_id],
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(license_relationship_node)
+                        added_spdx_ids.add(license_rel_spdx_id)
+                
+                # Check if license is in SPDX mappings
+                elif selectedIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
+                    logger.info("        Selected license \"%s\" maps to SPDX ID: \"%s\"" % (selectedIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]))
+                    spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]
+                    license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
+                    
+                    if license_spdx_id not in added_spdx_ids:
+                        license_node = {
+                            "spdxId": license_spdx_id,
+                            "type": "simplelicensing_LicenseExpression",
+                            "simplelicensing_licenseExpression": spdx_mapped_license,
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(license_node)
+                        added_spdx_ids.add(license_spdx_id)
+                    
+                    # Create relationship
+                    license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{spdx_mapped_license}-selected-{inventoryID}"
+                    if license_rel_spdx_id not in added_spdx_ids:
+                        license_relationship_node = {
+                            "spdxId": license_rel_spdx_id,
+                            "type": "Relationship",
+                            "relationshipType": "hasConcludedLicense",
+                            "from": inventoryLink,
+                            "to": [license_spdx_id],
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(license_relationship_node)
+                        added_spdx_ids.add(license_rel_spdx_id)
+                
+                else:
+                    # License not in SPDX mappings - create CustomLicense with LicenseRef
+                    logger.warning("        Selected license \"%s\" is not a valid SPDX identifier. - Using LicenseRef." % (selectedIdentifier))
+                    
+                    # Clean up the identifier
+                    cleanedIdentifier = selectedIdentifier.split("(", 1)[0].rstrip()  # Remove everything after (
+                    cleanedIdentifier = re.sub('[^a-zA-Z0-9 \n\.]', '-', cleanedIdentifier)  # Replace special chars with dash
+                    cleanedIdentifier = cleanedIdentifier.replace(" ", "-")  # Replace space with dash
+                    licenseReference = "LicenseRef-%s" % cleanedIdentifier
+                    
+                    # Priority: noticeText > asFoundLicenseText > selectedIdentifier
+                    extractedText = (inventoryItem.get("noticeText") or 
+                                   inventoryItem.get("asFoundLicenseText") or 
+                                   selectedIdentifier)
+                    
+                    custom_license_spdx_id = f"{namespaceMap}{licenseReference}"
+                    
+                    # Create CustomLicense element
+                    if custom_license_spdx_id not in added_spdx_ids:
+                        custom_license_node = {
+                            "spdxId": custom_license_spdx_id,
+                            "type": "expandedlicensing_CustomLicense",
+                            "simplelicensing_licenseText": extractedText,
+                            "name": cleanedIdentifier,
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(custom_license_node)
+                        added_spdx_ids.add(custom_license_spdx_id)
+                    
+                    # Create relationship between package and custom license
+                    custom_license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{licenseReference}-selected-{inventoryID}"
+                    if custom_license_rel_spdx_id not in added_spdx_ids:
+                        custom_license_relationship_node = {
+                            "spdxId": custom_license_rel_spdx_id,
+                            "type": "Relationship",
+                            "relationshipType": "hasConcludedLicense",
+                            "from": inventoryLink,
+                            "to": [custom_license_spdx_id],
+                            "creationInfo": "_:creationInfo_0"
+                        }
+                        reportDetails["@graph"].append(custom_license_relationship_node)
+                        added_spdx_ids.add(custom_license_rel_spdx_id)
 
             # add dependency relationship if applicable at package level
             if inventoryItem.get("parentInventory") is not None:
