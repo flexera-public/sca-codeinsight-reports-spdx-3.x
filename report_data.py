@@ -133,15 +133,23 @@ def gather_data_for_report(projectID, reportData):
                         "to": [file_spdx_id],
                         "creationInfo": "_:creationInfo_0"
                     }
+                    # Process file-level license evidence from scanning
+                    # Per SPDX 3.0.1: File-level licenses are hasConcludedLicense because they represent
+                    # the tool's analysis/conclusion, not declarations within the file itself
                     package_associated_license = report_data_db.get_file_license_evidence(projectID, fileid)
-                    if package_associated_license is not None and isinstance(package_associated_license, list):
+                    if package_associated_license is not None and isinstance(package_associated_license, list) and len(package_associated_license) > 0:
+                        file_license_expressions = []
+                        
                         for license_item in package_associated_license:
                             if license_item.get("LICENSE"):
                                 license = license_item["LICENSE"]
                                 # Check if the license is in SPDX mappings
                                 if license in SPDX_license_mappings.LICENSEMAPPINGS:
                                     license = SPDX_license_mappings.LICENSEMAPPINGS[license]
+                                
+                                file_license_expressions.append(license)
                                 license_spdx_id = f"{namespaceMap}{projectID}-{license}"
+                                
                                 # Only add license if spdxId is unique
                                 if license_spdx_id not in added_spdx_ids:
                                     package_file_license_node = {
@@ -152,19 +160,40 @@ def gather_data_for_report(projectID, reportData):
                                     }
                                     reportDetails["@graph"].append(package_file_license_node)
                                     added_spdx_ids.add(license_spdx_id)
-
-                                license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{license}"
-                                if license_rel_spdx_id not in added_spdx_ids:
-                                    package_file_license_relationship_node = {
-                                        "spdxId": license_rel_spdx_id,
-                                        "type": "Relationship",
-                                        "relationshipType": "hasConcludedLicense",
-                                        "from": inventoryLink,
-                                        "to": [license_spdx_id],
-                                        "creationInfo": "_:creationInfo_0"
-                                    }
-                                    reportDetails["@graph"].append(package_file_license_relationship_node)
-                                    added_spdx_ids.add(license_rel_spdx_id)
+                        
+                        # Create a single concluded license relationship with OR expression if multiple licenses
+                        if file_license_expressions:
+                            file_license_expression = create_license_expression(file_license_expressions, use_or=True)
+                            file_license_expr_spdx_id = f"{namespaceMap}{projectID}-file-concluded-{fileid}"
+                            
+                            # Create the license expression node if needed
+                            if len(file_license_expressions) > 1 and file_license_expr_spdx_id not in added_spdx_ids:
+                                file_license_expr_node = {
+                                    "spdxId": file_license_expr_spdx_id,
+                                    "type": "simplelicensing_LicenseExpression",
+                                    "simplelicensing_licenseExpression": file_license_expression,
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(file_license_expr_node)
+                                added_spdx_ids.add(file_license_expr_spdx_id)
+                            
+                            # Create hasConcludedLicense relationship from package to file licenses
+                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-file-{fileid}-concluded"
+                            if license_rel_spdx_id not in added_spdx_ids:
+                                # Use the expression node if multiple licenses, otherwise the single license
+                                target_license_id = file_license_expr_spdx_id if len(file_license_expressions) > 1 else f"{namespaceMap}{projectID}-{file_license_expressions[0]}"
+                                
+                                package_file_license_relationship_node = {
+                                    "spdxId": license_rel_spdx_id,
+                                    "type": "Relationship",
+                                    "relationshipType": "hasConcludedLicense",
+                                    "from": inventoryLink,
+                                    "to": [target_license_id],
+                                    "comment": f"License concluded from file-level analysis of {fileName}",
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                reportDetails["@graph"].append(package_file_license_relationship_node)
+                                added_spdx_ids.add(license_rel_spdx_id)
 
                     # Only add relationship if spdxId is unique
                     rel_spdx_id = package_relationship_file_node["spdxId"]
@@ -293,11 +322,18 @@ def gather_data_for_report(projectID, reportData):
                 reportDetails["@graph"].append(package_node)
                 added_spdx_ids.add(inventoryLink)
 
-            # Process package-level licenses (declared licenses from component)
+            # Process package-level licenses (declared licenses from component metadata)
+            # Per SPDX 3.0.1: hasDeclaredLicense = license info found IN the package itself
+            # (e.g., LICENSE file, README, package metadata, manifest files)
             componentId = inventoryItem.get("componentId")
+            declared_license_ids = []  # Track declared licenses for comparison
+            
             if componentId is not None:
                 possibleLicenses = report_data_db.get_component_possible_Licenses(componentId)
-                if possibleLicenses is not None and isinstance(possibleLicenses, list):
+                if possibleLicenses is not None and isinstance(possibleLicenses, list) and len(possibleLicenses) > 0:
+                    # Collect all declared license identifiers for potential OR expression
+                    declared_licenses_for_expression = []
+                    
                     for license in possibleLicenses:
                         licenseName = license.get("licenseName")
                         
@@ -313,6 +349,9 @@ def gather_data_for_report(projectID, reportData):
                         if licenseName == "Public Domain":
                             logger.info("        Added to NONE declaredLicenses since Public Domain.")
                             license_spdx_id = f"{namespaceMap}{projectID}-NONE"
+                            declared_license_ids.append(license_spdx_id)
+                            declared_licenses_for_expression.append("NONE")
+                            
                             if license_spdx_id not in added_spdx_ids:
                                 none_license_node = {
                                     "spdxId": license_spdx_id,
@@ -322,26 +361,14 @@ def gather_data_for_report(projectID, reportData):
                                 }
                                 reportDetails["@graph"].append(none_license_node)
                                 added_spdx_ids.add(license_spdx_id)
-                            
-                            # Create relationship
-                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-NONE-{inventoryID}"
-                            if license_rel_spdx_id not in added_spdx_ids:
-                                license_relationship_node = {
-                                    "spdxId": license_rel_spdx_id,
-                                    "type": "Relationship",
-                                    "relationshipType": "hasConcludedLicense",
-                                    "from": inventoryLink,
-                                    "to": [license_spdx_id],
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(license_relationship_node)
-                                added_spdx_ids.add(license_rel_spdx_id)
                         
                         # Check if license is in SPDX mappings
                         elif possibleLicenseSPDXIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
                             logger.info("        \"%s\" maps to SPDX ID: \"%s\"" % (possibleLicenseSPDXIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]))
                             spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]
                             license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
+                            declared_license_ids.append(license_spdx_id)
+                            declared_licenses_for_expression.append(spdx_mapped_license)
                             
                             if license_spdx_id not in added_spdx_ids:
                                 license_node = {
@@ -352,20 +379,6 @@ def gather_data_for_report(projectID, reportData):
                                 }
                                 reportDetails["@graph"].append(license_node)
                                 added_spdx_ids.add(license_spdx_id)
-                            
-                            # Create relationship
-                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{spdx_mapped_license}-{inventoryID}"
-                            if license_rel_spdx_id not in added_spdx_ids:
-                                license_relationship_node = {
-                                    "spdxId": license_rel_spdx_id,
-                                    "type": "Relationship",
-                                    "relationshipType": "hasConcludedLicense",
-                                    "from": inventoryLink,
-                                    "to": [license_spdx_id],
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(license_relationship_node)
-                                added_spdx_ids.add(license_rel_spdx_id)
                         
                         else:
                             # License not in SPDX mappings - create CustomLicense with LicenseRef
@@ -383,6 +396,8 @@ def gather_data_for_report(projectID, reportData):
                                            possibleLicenseSPDXIdentifier)
                             
                             custom_license_spdx_id = f"{namespaceMap}{licenseReference}"
+                            declared_license_ids.append(custom_license_spdx_id)
+                            declared_licenses_for_expression.append(licenseReference)
                             
                             # Create CustomLicense element (SPDX 3.x equivalent of hasExtractedLicensingInfos)
                             if custom_license_spdx_id not in added_spdx_ids:
@@ -395,25 +410,44 @@ def gather_data_for_report(projectID, reportData):
                                 }
                                 reportDetails["@graph"].append(custom_license_node)
                                 added_spdx_ids.add(custom_license_spdx_id)
-                            
-                            # Create relationship between package and custom license
-                            custom_license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{licenseReference}-{inventoryID}"
-                            if custom_license_rel_spdx_id not in added_spdx_ids:
-                                custom_license_relationship_node = {
-                                    "spdxId": custom_license_rel_spdx_id,
-                                    "type": "Relationship",
-                                    "relationshipType": "hasConcludedLicense",
-                                    "from": inventoryLink,
-                                    "to": [custom_license_spdx_id],
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(custom_license_relationship_node)
-                                added_spdx_ids.add(custom_license_rel_spdx_id)
+                    
+                    # Create hasDeclaredLicense relationship with proper license expression
+                    # Multiple licenses typically represent alternatives (OR) not conjunctions (AND)
+                    if declared_license_ids:
+                        license_expression = create_license_expression(declared_licenses_for_expression, use_or=True)
+                        license_expr_spdx_id = f"{namespaceMap}{projectID}-declared-{inventoryID}"
+                        
+                        if license_expr_spdx_id not in added_spdx_ids:
+                            license_expr_node = {
+                                "spdxId": license_expr_spdx_id,
+                                "type": "simplelicensing_LicenseExpression",
+                                "simplelicensing_licenseExpression": license_expression,
+                                "creationInfo": "_:creationInfo_0"
+                            }
+                            reportDetails["@graph"].append(license_expr_node)
+                            added_spdx_ids.add(license_expr_spdx_id)
+                        
+                        # Create hasDeclaredLicense relationship
+                        declared_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-declared-{inventoryID}"
+                        if declared_rel_spdx_id not in added_spdx_ids:
+                            declared_license_relationship_node = {
+                                "spdxId": declared_rel_spdx_id,
+                                "type": "Relationship",
+                                "relationshipType": "hasDeclaredLicense",
+                                "from": inventoryLink,
+                                "to": [license_expr_spdx_id],
+                                "creationInfo": "_:creationInfo_0"
+                            }
+                            reportDetails["@graph"].append(declared_license_relationship_node)
+                            added_spdx_ids.add(declared_rel_spdx_id)
 
-            # Process inventory-specific selected license (the license chosen for this specific inventory item)
+            # Process inventory-specific selected license (concluded license based on user determination)
+            # Per SPDX 3.0.1: hasConcludedLicense = license determined by SPDX data creator
+            # after analyzing the software artifact and other information
             selectedLicenseName = inventoryItem.get("selectedLicenseName")
             selectedLicenseSPDXIdentifier = inventoryItem.get("selectedLicenseSPDXIdentifier")
             shortName = inventoryItem.get("shortName")
+            concluded_license_spdx_id = None  # Track for comparison with declared
             
             if selectedLicenseName is not None and selectedLicenseName != "":
                 # Determine the SPDX identifier to use
@@ -424,63 +458,41 @@ def gather_data_for_report(projectID, reportData):
                 else:
                     selectedIdentifier = selectedLicenseName
                 
+                # Prepare comment if concluded differs from declared
+                concluded_comment = None
+                
                 # Handle Public Domain as NONE
                 if selectedLicenseName == "Public Domain":
                     logger.info("        Added to NONE concludedLicense for selected license since Public Domain.")
-                    license_spdx_id = f"{namespaceMap}{projectID}-NONE"
-                    if license_spdx_id not in added_spdx_ids:
+                    concluded_license_spdx_id = f"{namespaceMap}{projectID}-NONE"
+                    concluded_expression = "NONE"
+                    
+                    if concluded_license_spdx_id not in added_spdx_ids:
                         none_license_node = {
-                            "spdxId": license_spdx_id,
+                            "spdxId": concluded_license_spdx_id,
                             "type": "simplelicensing_LicenseExpression",
                             "simplelicensing_licenseExpression": "NONE",
                             "creationInfo": "_:creationInfo_0"
                         }
                         reportDetails["@graph"].append(none_license_node)
-                        added_spdx_ids.add(license_spdx_id)
-                    
-                    # Create relationship
-                    license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-NONE-selected-{inventoryID}"
-                    if license_rel_spdx_id not in added_spdx_ids:
-                        license_relationship_node = {
-                            "spdxId": license_rel_spdx_id,
-                            "type": "Relationship",
-                            "relationshipType": "hasConcludedLicense",
-                            "from": inventoryLink,
-                            "to": [license_spdx_id],
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(license_relationship_node)
-                        added_spdx_ids.add(license_rel_spdx_id)
+                        added_spdx_ids.add(concluded_license_spdx_id)
                 
                 # Check if license is in SPDX mappings
                 elif selectedIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
                     logger.info("        Selected license \"%s\" maps to SPDX ID: \"%s\"" % (selectedIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]))
                     spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]
-                    license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
+                    concluded_license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
+                    concluded_expression = spdx_mapped_license
                     
-                    if license_spdx_id not in added_spdx_ids:
+                    if concluded_license_spdx_id not in added_spdx_ids:
                         license_node = {
-                            "spdxId": license_spdx_id,
+                            "spdxId": concluded_license_spdx_id,
                             "type": "simplelicensing_LicenseExpression",
                             "simplelicensing_licenseExpression": spdx_mapped_license,
                             "creationInfo": "_:creationInfo_0"
                         }
                         reportDetails["@graph"].append(license_node)
-                        added_spdx_ids.add(license_spdx_id)
-                    
-                    # Create relationship
-                    license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{spdx_mapped_license}-selected-{inventoryID}"
-                    if license_rel_spdx_id not in added_spdx_ids:
-                        license_relationship_node = {
-                            "spdxId": license_rel_spdx_id,
-                            "type": "Relationship",
-                            "relationshipType": "hasConcludedLicense",
-                            "from": inventoryLink,
-                            "to": [license_spdx_id],
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(license_relationship_node)
-                        added_spdx_ids.add(license_rel_spdx_id)
+                        added_spdx_ids.add(concluded_license_spdx_id)
                 
                 else:
                     # License not in SPDX mappings - create CustomLicense with LicenseRef
@@ -497,33 +509,43 @@ def gather_data_for_report(projectID, reportData):
                                    inventoryItem.get("asFoundLicenseText") or 
                                    selectedIdentifier)
                     
-                    custom_license_spdx_id = f"{namespaceMap}{licenseReference}"
+                    concluded_license_spdx_id = f"{namespaceMap}{licenseReference}"
+                    concluded_expression = licenseReference
                     
                     # Create CustomLicense element
-                    if custom_license_spdx_id not in added_spdx_ids:
+                    if concluded_license_spdx_id not in added_spdx_ids:
                         custom_license_node = {
-                            "spdxId": custom_license_spdx_id,
+                            "spdxId": concluded_license_spdx_id,
                             "type": "expandedlicensing_CustomLicense",
                             "simplelicensing_licenseText": extractedText,
                             "name": cleanedIdentifier,
                             "creationInfo": "_:creationInfo_0"
                         }
                         reportDetails["@graph"].append(custom_license_node)
-                        added_spdx_ids.add(custom_license_spdx_id)
+                        added_spdx_ids.add(concluded_license_spdx_id)
+                
+                # Check if concluded license differs from declared licenses
+                # Per SPDX 3.0.1: If concluded != declared, a written explanation SHOULD be provided
+                if declared_license_ids and concluded_license_spdx_id not in declared_license_ids:
+                    concluded_comment = f"Concluded license '{concluded_expression}' selected from available declared licenses based on analysis and user determination."
+                
+                # Create hasConcludedLicense relationship
+                license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-concluded-selected-{inventoryID}"
+                if license_rel_spdx_id not in added_spdx_ids:
+                    license_relationship_node = {
+                        "spdxId": license_rel_spdx_id,
+                        "type": "Relationship",
+                        "relationshipType": "hasConcludedLicense",
+                        "from": inventoryLink,
+                        "to": [concluded_license_spdx_id],
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    # Add comment if concluded differs from declared
+                    if concluded_comment:
+                        license_relationship_node["comment"] = concluded_comment
                     
-                    # Create relationship between package and custom license
-                    custom_license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{licenseReference}-selected-{inventoryID}"
-                    if custom_license_rel_spdx_id not in added_spdx_ids:
-                        custom_license_relationship_node = {
-                            "spdxId": custom_license_rel_spdx_id,
-                            "type": "Relationship",
-                            "relationshipType": "hasConcludedLicense",
-                            "from": inventoryLink,
-                            "to": [custom_license_spdx_id],
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(custom_license_relationship_node)
-                        added_spdx_ids.add(custom_license_rel_spdx_id)
+                    reportDetails["@graph"].append(license_relationship_node)
+                    added_spdx_ids.add(license_rel_spdx_id)
 
             # add dependency relationship if applicable at package level
             if inventoryItem.get("parentInventory") is not None:
@@ -547,6 +569,159 @@ def gather_data_for_report(projectID, reportData):
                 if parent_rel_spdx_id not in added_spdx_ids:
                     reportDetails["@graph"].append(parent_relationship_node)
                     added_spdx_ids.add(parent_rel_spdx_id)
+
+            # Process vulnerabilities for this component
+            # Per SPDX 3.0.1: Vulnerability class represents security vulnerabilities
+            component_version_id = inventoryItem.get("component_version_id")
+            if component_version_id is not None:
+                vulnerabilities = report_data_db.get_component_version_vdr_vulnerabilities(projectID, component_version_id)
+                
+                if vulnerabilities is not None and isinstance(vulnerabilities, list) and len(vulnerabilities) > 0:
+                    for vuln in vulnerabilities:
+                        vuln_id = vuln.get("vulnerabilityId")
+                        vuln_name = vuln.get("vulnerabilityName")
+                        
+                        if vuln_name:
+                            # Create unique SPDX ID for vulnerability
+                            vuln_spdx_id = f"{namespaceMap}Vulnerability-{vuln_name}"
+                            
+                            # Only add vulnerability if not already added
+                            if vuln_spdx_id not in added_spdx_ids:
+                                # Build vulnerability node according to SPDX 3.0.1
+                                vulnerability_node = {
+                                    "spdxId": vuln_spdx_id,
+                                    "type": "security_Vulnerability",
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                
+                                # Add description
+                                vuln_desc = vuln.get("vulnerabilityDescription")
+                                if vuln_desc:
+                                    vulnerability_node["description"] = vuln_desc
+                                
+                                # Add summary (brief description)
+                                if vuln_desc:
+                                    # Create a summary - first sentence or first 100 chars
+                                    summary = vuln_desc.split('.')[0] if '.' in vuln_desc else vuln_desc[:100]
+                                    vulnerability_node["summary"] = summary
+                                
+                                # Add externalIdentifier for CVE
+                                if vuln_name:
+                                    external_id = {
+                                        "type": "ExternalIdentifier",
+                                        "identifier": vuln_name,
+                                        "externalIdentifierType": "cve"
+                                    }
+                                    # Add CVE locator URL if this is a CVE identifier
+                                    if vuln_name.startswith("CVE-"):
+                                        external_id["identifierLocator"] = [f"https://www.cve.org/CVERecord?id={vuln_name}"]
+                                    vulnerability_node["externalIdentifier"] = [external_id]
+                                
+                                # Add externalRef for advisory URLs
+                                external_refs = []
+                                if vuln.get("vulnerabilityUrl"):
+                                    external_refs.append({
+                                        "type": "ExternalRef",
+                                        "locator": [vuln.get("vulnerabilityUrl")],
+                                        "externalRefType": "securityAdvisory"
+                                    })
+                                if external_refs:
+                                    vulnerability_node["externalRef"] = external_refs
+                                
+                                # Add published date - convert MM/DD/YYYY to ISO format
+                                if vuln.get("publishedDate"):
+                                    try:
+                                        pub_date = vuln.get("publishedDate")
+                                        # Parse MM/DD/YYYY and convert to ISO format
+                                        dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
+                                        vulnerability_node["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                    except:
+                                        pass
+                                
+                                # Add vulnerability node to report
+                                reportDetails["@graph"].append(vulnerability_node)
+                                added_spdx_ids.add(vuln_spdx_id)
+                            
+                            # Create relationship from package to vulnerability
+                            vuln_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-hasVulnerability-{vuln_name}"
+                            if vuln_rel_spdx_id not in added_spdx_ids:
+                                vulnerability_relationship = {
+                                    "spdxId": vuln_rel_spdx_id,
+                                    "type": "Relationship",
+                                    "relationshipType": "hasAssociatedVulnerability",
+                                    "from": inventoryLink,
+                                    "to": [vuln_spdx_id],
+                                    "creationInfo": "_:creationInfo_0"
+                                }
+                                
+                                reportDetails["@graph"].append(vulnerability_relationship)
+                                added_spdx_ids.add(vuln_rel_spdx_id)
+                            
+                            # Create CVSS v3 assessment relationship if vector string available (required field)
+                            if vuln.get("vulnerabilityCvssV3Vector"):
+                                cvssv3_rel_spdx_id = f"{namespaceMap}CvssV3Assessment-{vuln_name}-{inventoryItemName}"
+                                if cvssv3_rel_spdx_id not in added_spdx_ids:
+                                    cvssv3_assessment = {
+                                        "spdxId": cvssv3_rel_spdx_id,
+                                        "type": "security_CvssV3VulnAssessmentRelationship",
+                                        "relationshipType": "hasAssessmentFor",
+                                        "from": vuln_spdx_id,
+                                        "to": [inventoryLink],
+                                        "security_assessedElement": inventoryLink,
+                                        "security_vectorString": vuln.get("vulnerabilityCvssV3Vector"),
+                                        "creationInfo": "_:creationInfo_0"
+                                    }
+                                    
+                                    # Add CVSS v3 score
+                                    if vuln.get("vulnerabilityCvssV3Score"):
+                                        cvssv3_assessment["security_score"] = str(vuln.get("vulnerabilityCvssV3Score"))
+                                    
+                                    # Add severity
+                                    if vuln.get("vulnerabilityCvssV3Severity"):
+                                        cvssv3_assessment["security_severity"] = vuln.get("vulnerabilityCvssV3Severity").lower()
+                                    
+                                    # Add published time
+                                    if vuln.get("publishedDate"):
+                                        try:
+                                            pub_date = vuln.get("publishedDate")
+                                            dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
+                                            cvssv3_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        except:
+                                            pass
+                                    
+                                    reportDetails["@graph"].append(cvssv3_assessment)
+                                    added_spdx_ids.add(cvssv3_rel_spdx_id)
+                            
+                            # Create CVSS v2 assessment relationship if vector string available (required field) and v3 not present
+                            if vuln.get("vulnerabilityCvssV2Vector") and not vuln.get("vulnerabilityCvssV3Vector"):
+                                cvssv2_rel_spdx_id = f"{namespaceMap}CvssV2Assessment-{vuln_name}-{inventoryItemName}"
+                                if cvssv2_rel_spdx_id not in added_spdx_ids:
+                                    cvssv2_assessment = {
+                                        "spdxId": cvssv2_rel_spdx_id,
+                                        "type": "security_CvssV2VulnAssessmentRelationship",
+                                        "relationshipType": "hasAssessmentFor",
+                                        "from": vuln_spdx_id,
+                                        "to": [inventoryLink],
+                                        "security_assessedElement": inventoryLink,
+                                        "security_vectorString": vuln.get("vulnerabilityCvssV2Vector"),
+                                        "creationInfo": "_:creationInfo_0"
+                                    }
+                                    
+                                    # Add CVSS v2 score
+                                    if vuln.get("vulnerabilityCvssV2Score"):
+                                        cvssv2_assessment["security_score"] = str(vuln.get("vulnerabilityCvssV2Score"))
+                                    
+                                    # Add published time
+                                    if vuln.get("publishedDate"):
+                                        try:
+                                            pub_date = vuln.get("publishedDate")
+                                            dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
+                                            cvssv2_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                        except:
+                                            pass
+                                    
+                                    reportDetails["@graph"].append(cvssv2_assessment)
+                                    added_spdx_ids.add(cvssv2_rel_spdx_id)
 
     spdx_document_info_node = {
       "spdxId": documentNamespace,
@@ -588,6 +763,48 @@ def gather_data_for_report(projectID, reportData):
     reportData["reportDetails"] = reportDetails
     reportData["projectList"] = projectList
     return reportData
+
+#-------------------------------------------------------
+def create_license_expression(licenses, use_or=True):
+    """
+    Create a proper SPDX license expression from a list of licenses.
+    
+    Args:
+        licenses: List of license identifiers
+        use_or: If True, use OR operator (for license alternatives/choices)
+               If False, use AND operator (when both licenses apply)
+    
+    Returns:
+        String with proper SPDX license expression
+    """
+    if not licenses or len(licenses) == 0:
+        return None
+    
+    if len(licenses) == 1:
+        return licenses[0]
+    
+    # Remove duplicates while preserving order
+    unique_licenses = []
+    for lic in licenses:
+        if lic not in unique_licenses:
+            unique_licenses.append(lic)
+    
+    if len(unique_licenses) == 1:
+        return unique_licenses[0]
+    
+    # Use OR for alternatives (most common case - component offers choice of licenses)
+    # Use AND only when explicitly needed (both licenses apply simultaneously)
+    operator = " OR " if use_or else " AND "
+    
+    # Wrap each license in parentheses if it contains operators
+    formatted_licenses = []
+    for lic in unique_licenses:
+        if " OR " in lic or " AND " in lic:
+            formatted_licenses.append(f"({lic})")
+        else:
+            formatted_licenses.append(lic)
+    
+    return operator.join(formatted_licenses)
 
 #-------------------------------------------------------
 def create_supplier_string(forge, componentName):
