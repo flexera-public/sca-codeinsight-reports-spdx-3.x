@@ -284,6 +284,34 @@ def get_custom_field_value(inventory_id, field_label="Archive Property"):
         logger.warning(f"No custom field value found for inventory ID: {inventory_id} and label: {field_label}")
         return "N/A"
 
+def get_all_custom_field_values(inventory_id):
+    # Step 1: Fetch all field metadata (every label and its column name)
+    sql_meta = "SELECT FIELD_NAME_, FIELD_LABEL_ FROM PAS_INVENTORY_FLEX_FIELDS_METADATA;"
+    meta_result = db_runner.run_query(sql_meta)
+    if not meta_result or not isinstance(meta_result, list) or len(meta_result) == 0:
+        logger.warning("No custom field metadata found in PAS_INVENTORY_FLEX_FIELDS_METADATA")
+        return []
+    # Step 2: Build a single SELECT that retrieves every flex column for this inventory
+    column_names = [row['FIELD_NAME_'] for row in meta_result if row.get('FIELD_NAME_')]
+    if not column_names:
+        return []
+    columns_sql = ", ".join(column_names)
+    sql_value = f"SELECT {columns_sql} FROM PAS_INVENTORY_FLEX_FIELDS WHERE INVENTORY_ID_ = {inventory_id};"
+    result = db_runner.run_query(sql_value)
+    # Step 3: Map column values back to their labels, skipping null/empty entries
+    custom_fields = []
+    if result and isinstance(result, list) and len(result) > 0:
+        row = result[0]
+        for meta in meta_result:
+            field_name = meta.get('FIELD_NAME_')
+            label = meta.get('FIELD_LABEL_')
+            if not field_name or not label:
+                continue
+            value = row.get(field_name)
+            if value is not None and str(value).strip():
+                custom_fields.append({"label": label, "value": str(value)})
+    return custom_fields
+
 def get_server_scanned_files(projectID, inventoryID=None):
     logger.info("Entering get_server_scanned_files")
     server_scanned_files_query = f"SELECT SCAN_FILE.ID_ AS fileId, SCAN_FILE.PATH_ AS filePath, SCAN_FILE.MD5_ AS fileMD5, SCAN_FILE.SHA1_ AS fileSHA1, GRP_FILES.GROUP_ID_ inInventory FROM PSE_SCANNED_FILES SCAN_FILE JOIN PSE_INVENTORY_GROUP_FILES GRP_FILES ON SCAN_FILE.ID_ = GRP_FILES.FILE_ID_ WHERE PROJECT_ID_ = {projectID} and GRP_FILES.GROUP_ID_ = {inventoryID};"
