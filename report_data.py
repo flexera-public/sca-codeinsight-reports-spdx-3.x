@@ -322,6 +322,25 @@ def gather_data_for_report(projectID, reportData):
                 reportDetails["@graph"].append(package_node)
                 added_spdx_ids.add(inventoryLink)
 
+            # Add all custom inventory fields as SPDX 3.x Annotation nodes (one per field)
+            custom_fields = report_data_db.get_all_custom_field_values(inventoryID)
+            for custom_field in custom_fields:
+                field_label = custom_field["label"]
+                field_value = custom_field["value"]
+                safe_label = re.sub(r'[^a-zA-Z0-9]', '-', field_label)
+                annotation_spdx_id = f"{namespaceMap}Annotation-{safe_label}-{inventoryID}"
+                if annotation_spdx_id not in added_spdx_ids:
+                    annotation_node = {
+                        "spdxId": annotation_spdx_id,
+                        "type": "Annotation",
+                        "annotationType": "other",
+                        "subject": inventoryLink,
+                        "statement": f"{field_label}: {field_value}",
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(annotation_node)
+                    added_spdx_ids.add(annotation_spdx_id)
+
             # Process package-level licenses (declared licenses from component metadata)
             # Per SPDX 3.0.1: hasDeclaredLicense = license info found IN the package itself
             # (e.g., LICENSE file, README, package metadata, manifest files)
