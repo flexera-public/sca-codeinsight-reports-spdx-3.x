@@ -16,6 +16,23 @@ import SPDX_license_mappings
 
 logger = logging.getLogger(__name__)
 #-------------------------------------------------------------------#
+def derive_cvss_severity(score):
+    # Qualitative rating scale shared by CVSS v3.x and v4.0 (FIRST.org spec)
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return None
+    if score == 0.0:
+        return "none"
+    elif score < 4.0:
+        return "low"
+    elif score < 7.0:
+        return "medium"
+    elif score < 9.0:
+        return "high"
+    else:
+        return "critical"
+#-------------------------------------------------------------------#
 def gather_data_for_report(projectID, reportData):
     logger.info("Entering gather_data_for_report")
     reportOptions = reportData["reportOptions"]
@@ -676,43 +693,76 @@ def gather_data_for_report(projectID, reportData):
                                 reportDetails["@graph"].append(vulnerability_relationship)
                                 added_spdx_ids.add(vuln_rel_spdx_id)
                             
-                            # Create CVSS v3 assessment relationship if vector string available (required field)
-                            if vuln.get("vulnerabilityCvssV3Vector"):
-                                cvssv3_rel_spdx_id = f"{namespaceMap}CvssV3Assessment-{vuln_name}-{inventoryItemName}"
-                                if cvssv3_rel_spdx_id not in added_spdx_ids:
-                                    cvssv3_assessment = {
-                                        "spdxId": cvssv3_rel_spdx_id,
-                                        "type": "security_CvssV3VulnAssessmentRelationship",
-                                        "relationshipType": "hasAssessmentFor",
-                                        "from": vuln_spdx_id,
-                                        "to": [inventoryLink],
-                                        "security_assessedElement": inventoryLink,
-                                        "security_vectorString": vuln.get("vulnerabilityCvssV3Vector"),
-                                        "creationInfo": "_:creationInfo_0"
-                                    }
-                                    
-                                    # Add CVSS v3 score
-                                    if vuln.get("vulnerabilityCvssV3Score"):
-                                        cvssv3_assessment["security_score"] = str(vuln.get("vulnerabilityCvssV3Score"))
-                                    
-                                    # Add severity
-                                    if vuln.get("vulnerabilityCvssV3Severity"):
-                                        cvssv3_assessment["security_severity"] = vuln.get("vulnerabilityCvssV3Severity").lower()
-                                    
-                                    # Add published time
-                                    if vuln.get("publishedDate"):
-                                        try:
-                                            pub_date = vuln.get("publishedDate")
-                                            dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
-                                            cvssv3_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                        except:
-                                            pass
-                                    
-                                    reportDetails["@graph"].append(cvssv3_assessment)
-                                    added_spdx_ids.add(cvssv3_rel_spdx_id)
+                            # Create CVSS v4 assessment relationship - score, severity and vectorString are all required (1..1) by the spec,
+                            # so only emit when vector+score are both present (severity is derived from score if not supplied)
+                            if vuln.get("vulnerabilityCvssV4Vector") and vuln.get("vulnerabilityCvssV4Score"):
+                                cvssv4_severity = vuln.get("vulnerabilityCvssV4Severity")
+                                cvssv4_severity = cvssv4_severity.lower() if cvssv4_severity else derive_cvss_severity(vuln.get("vulnerabilityCvssV4Score"))
+                                if cvssv4_severity:
+                                    cvssv4_rel_spdx_id = f"{namespaceMap}CvssV4Assessment-{vuln_name}-{inventoryItemName}"
+                                    if cvssv4_rel_spdx_id not in added_spdx_ids:
+                                        cvssv4_assessment = {
+                                            "spdxId": cvssv4_rel_spdx_id,
+                                            "type": "security_CvssV4VulnAssessmentRelationship",
+                                            "relationshipType": "hasAssessmentFor",
+                                            "from": vuln_spdx_id,
+                                            "to": [inventoryLink],
+                                            "security_assessedElement": inventoryLink,
+                                            "security_score": str(vuln.get("vulnerabilityCvssV4Score")),
+                                            "security_vectorString": vuln.get("vulnerabilityCvssV4Vector"),
+                                            "security_severity": cvssv4_severity,
+                                            "creationInfo": "_:creationInfo_0"
+                                        }
+                                        
+                                        # Add published time
+                                        if vuln.get("publishedDate"):
+                                            try:
+                                                pub_date = vuln.get("publishedDate")
+                                                dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
+                                                cvssv4_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                            except:
+                                                pass
+                                        
+                                        reportDetails["@graph"].append(cvssv4_assessment)
+                                        added_spdx_ids.add(cvssv4_rel_spdx_id)
                             
-                            # Create CVSS v2 assessment relationship if vector string available (required field) and v3 not present
-                            if vuln.get("vulnerabilityCvssV2Vector") and not vuln.get("vulnerabilityCvssV3Vector"):
+                            # Create CVSS v3 assessment relationship - score, severity and vectorString are all required (1..1) by the spec,
+                            # so only emit when vector+score are both present (severity is derived from score if not supplied)
+                            if vuln.get("vulnerabilityCvssV3Vector") and vuln.get("vulnerabilityCvssV3Score"):
+                                cvssv3_severity = vuln.get("vulnerabilityCvssV3Severity")
+                                cvssv3_severity = cvssv3_severity.lower() if cvssv3_severity else derive_cvss_severity(vuln.get("vulnerabilityCvssV3Score"))
+                                if cvssv3_severity:
+                                    cvssv3_rel_spdx_id = f"{namespaceMap}CvssV3Assessment-{vuln_name}-{inventoryItemName}"
+                                    if cvssv3_rel_spdx_id not in added_spdx_ids:
+                                        cvssv3_assessment = {
+                                            "spdxId": cvssv3_rel_spdx_id,
+                                            "type": "security_CvssV3VulnAssessmentRelationship",
+                                            "relationshipType": "hasAssessmentFor",
+                                            "from": vuln_spdx_id,
+                                            "to": [inventoryLink],
+                                            "security_assessedElement": inventoryLink,
+                                            "security_vectorString": vuln.get("vulnerabilityCvssV3Vector"),
+                                            "security_score": str(vuln.get("vulnerabilityCvssV3Score")),
+                                            "security_severity": cvssv3_severity,
+                                            "creationInfo": "_:creationInfo_0"
+                                        }
+                                        
+                                        # Add published time
+                                        if vuln.get("publishedDate"):
+                                            try:
+                                                pub_date = vuln.get("publishedDate")
+                                                dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
+                                                cvssv3_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                                            except:
+                                                pass
+                                        
+                                        reportDetails["@graph"].append(cvssv3_assessment)
+                                        added_spdx_ids.add(cvssv3_rel_spdx_id)
+                            
+                            # Create CVSS v2 assessment relationship - score and vectorString are both required (1..1) by the spec
+                            # (v2 has no severity property). Emitted independently of v3/v4 - SPDX models each CVSS version
+                            # as its own concrete relationship type.
+                            if vuln.get("vulnerabilityCvssV2Vector") and vuln.get("vulnerabilityCvssV2Score"):
                                 cvssv2_rel_spdx_id = f"{namespaceMap}CvssV2Assessment-{vuln_name}-{inventoryItemName}"
                                 if cvssv2_rel_spdx_id not in added_spdx_ids:
                                     cvssv2_assessment = {
@@ -723,12 +773,9 @@ def gather_data_for_report(projectID, reportData):
                                         "to": [inventoryLink],
                                         "security_assessedElement": inventoryLink,
                                         "security_vectorString": vuln.get("vulnerabilityCvssV2Vector"),
+                                        "security_score": str(vuln.get("vulnerabilityCvssV2Score")),
                                         "creationInfo": "_:creationInfo_0"
                                     }
-                                    
-                                    # Add CVSS v2 score
-                                    if vuln.get("vulnerabilityCvssV2Score"):
-                                        cvssv2_assessment["security_score"] = str(vuln.get("vulnerabilityCvssV2Score"))
                                     
                                     # Add published time
                                     if vuln.get("publishedDate"):
