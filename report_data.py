@@ -1,891 +1,543 @@
 '''
-Copyright 2023 Flexera Software LLC
+Copyright 2020 Flexera Software LLC
 See LICENSE.TXT for full license text
 SPDX-License-Identifier: MIT
 
 Author : sgeary  
-Created On : Tue Aug 29 2023
-Modified By : sarthak
-Modified On: Oct Mon 07 2025
+Created On : Fri Aug 07 2020
 File : report_data.py
 '''
 
-import logging, unicodedata, uuid, hashlib, datetime, re
-import report_data_db
-import SPDX_license_mappings
+import logging, re
+
+import common.api.project.get_child_projects
+import common.api.project.get_project_information
+import common.api.project.get_inventory_summary
+import common.api.license.license_lookup
+import common.api.component.get_component_details
+import common.api.inventory.get_inventory_details
 
 logger = logging.getLogger(__name__)
+
 #-------------------------------------------------------------------#
-def derive_cvss_severity(score):
-    # Qualitative rating scale shared by CVSS v3.x and v4.0 (FIRST.org spec)
-    try:
-        score = float(score)
-    except (TypeError, ValueError):
-        return None
-    if score == 0.0:
-        return "none"
-    elif score < 4.0:
-        return "low"
-    elif score < 7.0:
-        return "medium"
-    elif score < 9.0:
-        return "high"
-    else:
-        return "critical"
-#-------------------------------------------------------------------#
-def gather_data_for_report(projectID, reportData):
+def gather_data_for_report(baseURL, projectID, authToken, reportData):
     logger.info("Entering gather_data_for_report")
+
     reportOptions = reportData["reportOptions"]
+    # Parse report options
     includeChildProjects = reportOptions["includeChildProjects"]  # True/False
-    creatorName = reportOptions.get("creatorName", "OrganizationName")
-    namespaceMap = "urn:spdx:"
-    inventoryLinks = []
-    project_Name = report_data_db.get_projects_data(projectID)
-    topLevelProjectName = project_Name
-    documentName = project_Name.replace(" ", "_")
-    documentNamespace  = f"{namespaceMap}-{documentName}-{str(uuid.uuid1())}"
-    
-    # SPDX 3.0.1 structure
-    reportDetails = {
-        "@context": "https://spdx.org/rdf/3.0.1/spdx-context.jsonld",
-        "@graph": []
-    }
-    
-    # Track added spdxIds to prevent duplicates
-    added_spdx_ids = set()
-    
-    creation_info_node= {
-      "@id": "_:creationInfo_0",
-      "type": "CreationInfo",
-      "specVersion": "3.0.1",
-      "created": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-      "createdBy": [ f"{namespaceMap}{creatorName}" ],
-      "createdUsing": [
-        "Tool: Revenera SCA - Code Insight"
-      ]
-    }
+    includeComplianceInformation = reportOptions["includeComplianceInformation"]  # True/False
+    cvssVersion = reportOptions["cvssVersion"]  # 2.0/3.x
+    maxVersionsBack = reportOptions["maxVersionsBack"]  # Postive Int value
 
-    reportDetails["@graph"].append(creation_info_node)
+    projectList = [] # List to hold parent/child details for report
+    inventoryData = {}  # Create a dictionary containing the inventory data using inventoryID as keys
+    projectData = {} # Create a dictionary containing the project level summary data using projectID as keys
+    licenseDetails = {} # Dictionary to store license details to avoid multiple lookups for same id
+    projectReviewStatus = {}
+    totalInventoryCount = 0
 
-    if includeChildProjects:
-        projectList = report_data_db.get_child_projects(projectID)
+    # Get the list of parent/child projects start at the base project
+    projectHierarchy = common.api.project.get_child_projects.get_child_projects_recursively(baseURL, projectID, authToken)
+
+    # Create a list of project data sorted by the project name at each level for report display  
+    # Add details for the parent node
+    nodeDetails = {}
+    nodeDetails["parent"] = "#"  # The root node
+    nodeDetails["projectName"] = projectHierarchy["name"]
+    nodeDetails["projectID"] = projectHierarchy["id"]
+    nodeDetails["projectLink"] = baseURL + "/codeinsight/FNCI#myprojectdetails/?id=" + str(projectHierarchy["id"]) + "&tab=projectInventory"
+    topLevelProjectName = projectHierarchy["name"]
+
+    projectList.append(nodeDetails)
+
+    if includeChildProjects == "true":
+        projectList = create_project_hierarchy(projectHierarchy, projectHierarchy["id"], projectList, baseURL)
     else:
-        projectList = []
-        projectList.append(projectID)
+        logger.debug("Child hierarchy disabled")
 
+    projectInventoryCount = {}
+
+    #  Gather the details for each project and summerize the data
     for project in projectList:
-        projectID = project
-        projectName = report_data_db.get_projects_data(projectID)
 
-        print("        Collect data for project: %s" %projectName)
+        projectID = project["projectID"]
+        projectName = project["projectName"]
+        projectLink = project["projectLink"]
 
-        print("            Collect inventory details.")
-        logger.info("            Collect inventory details")
-        inventoryItems = report_data_db.get_inventory_data(projectID)
-        if inventoryItems is None:
-            inventoryItems = []
-        inventoryItemsCustom = report_data_db.get_inventory_data_custom(projectID)
-        if inventoryItemsCustom is not None and inventoryItemsCustom != []:
-            inventoryItems += inventoryItemsCustom
-        print("            Inventory has been collected.")
-        logger.info("            Inventory has been collected.")      
+        # Get project information with rollup summary data
+        try:
+            projectInformation = common.api.project.get_project_information.get_project_information_summary(baseURL, projectID, authToken)
+        except:
+            logger.error("    No Project Information Returned for %s!" %projectName)
+            print("No Project Information Returned for %s." %projectName)
+
+        # Get project summary information
+        if cvssVersion == "3.x":
+            projectInventorySummary = common.api.project.get_inventory_summary.get_project_inventory_with_v3_summary(baseURL, projectID, authToken)
+        else:
+            projectInventorySummary = common.api.project.get_inventory_summary.get_project_inventory_with_v2_summary(baseURL, projectID, authToken)
         
-        # To check inventory type between License Only or WIP
-        inventoriesNotInRepo = report_data_db.get_inventories_not_in_repo(projectID)    # To handle WIP and License Only inventories
-        inventoryItems += inventoriesNotInRepo
+        if not projectInventorySummary:
+            logger.warning("    Project %s contains no inventory items" %projectName)
+            print("Project %s contains no inventory items." %projectName)
 
-        for inventoryItem in inventoryItems:
-            fileHashes = []
-            inventoryCopyrights = []  # Initialize inventory-level copyright collection
-            inventoryID = inventoryItem["inventoryID"]
-            inventoryItemName = inventoryItem["inventoryItemName"]
-            inventoryLink = f"{namespaceMap}ProjectId-{projectID}-InventoryId-{inventoryID}"
-            if inventoryLink not in inventoryLinks:
-                inventoryLinks.append(inventoryLink)
+        projectInventoryCount[projectName] = len(projectInventorySummary)
+        totalInventoryCount += len(projectInventorySummary)
 
-            inventoryAssociatedServerScannedFiles = report_data_db.get_server_scanned_files(projectID, inventoryID)
-            if inventoryAssociatedServerScannedFiles is not None:
-                for inventoryAssociatedFile in inventoryAssociatedServerScannedFiles:
-                    fileHashes.append(inventoryAssociatedFile.get("fileSHA1"))
-                    fileid = inventoryAssociatedFile['fileId']
-                    fileName = inventoryAssociatedFile["filePath"].split("/")[-1]
-                    file_spdx_id = f"{namespaceMap}ProjectId-{projectID}-FileId-{fileid}"
-                    package_associated_Copyrights = report_data_db.get_project_copyright_evidence(projectID, fileid)
-                    
-                    # Single copyright processing for both file and inventory
-                    fileCopyright = "NOASSERTION"  # Default for file
-                    if package_associated_Copyrights and isinstance(package_associated_Copyrights, list) and len(package_associated_Copyrights) > 0:
-                        copyright_values = [item.get("COPYRIGHT") for item in package_associated_Copyrights if item.get("COPYRIGHT")]
-                        if copyright_values:
-                            fileCopyright = " | ".join(copyright_values)  # For this specific file
-                            inventoryCopyrights.extend(copyright_values)  # Add to inventory collection
-                    
-                    # Only add if this spdxId hasn't been added before
-                    if file_spdx_id not in added_spdx_ids:
-                        package_file_associated_node = {
-                            "spdxId": file_spdx_id,
-                            "type": "software_File",
-                            "software_copyrightText": fileCopyright,  # Use file-specific copyright
-                            "verifiedUsing" : [ {
-                            "type" : "Hash",
-                            "algorithm" : "md5",
-                            "hashValue" : inventoryAssociatedFile.get("fileMD5")
-                            }, {
-                            "type" : "Hash",
-                            "algorithm" : "sha1",
-                            "hashValue" : inventoryAssociatedFile.get("fileSHA1")
-                            } ],
-                            "name": fileName,
-                            "software_primaryPurpose": "source",
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(package_file_associated_node)
-                        added_spdx_ids.add(file_spdx_id)
-                    
-                    package_relationship_file_node = {
-                        "spdxId": f"{namespaceMap}{projectID}-{inventoryItemName}-{fileName}",
-                        "type": "Relationship",
-                        "relationshipType": "contains",
-                        "from": inventoryLink,
-                        "to": [file_spdx_id],
-                        "creationInfo": "_:creationInfo_0"
-                    }
-                    # Process file-level license evidence from scanning
-                    # Per SPDX 3.0.1: File-level licenses are hasConcludedLicense because they represent
-                    # the tool's analysis/conclusion, not declarations within the file itself
-                    package_associated_license = report_data_db.get_file_license_evidence(projectID, fileid)
-                    if package_associated_license is not None and isinstance(package_associated_license, list) and len(package_associated_license) > 0:
-                        file_license_expressions = []
-                        
-                        for license_item in package_associated_license:
-                            if license_item.get("LICENSE"):
-                                license = license_item["LICENSE"]
-                                # Check if the license is in SPDX mappings
-                                if license in SPDX_license_mappings.LICENSEMAPPINGS:
-                                    license = SPDX_license_mappings.LICENSEMAPPINGS[license]
-                                
-                                file_license_expressions.append(license)
-                                license_spdx_id = f"{namespaceMap}{projectID}-{license}"
-                                
-                                # Only add license if spdxId is unique
-                                if license_spdx_id not in added_spdx_ids:
-                                    package_file_license_node = {
-                                        "spdxId": license_spdx_id,
-                                        "type": "simplelicensing_LicenseExpression",
-                                        "simplelicensing_licenseExpression": license,
-                                        "creationInfo": "_:creationInfo_0"
-                                    }
-                                    reportDetails["@graph"].append(package_file_license_node)
-                                    added_spdx_ids.add(license_spdx_id)
-                        
-                        # Create a single concluded license relationship with OR expression if multiple licenses
-                        if file_license_expressions:
-                            file_license_expression = create_license_expression(file_license_expressions, use_or=True)
-                            file_license_expr_spdx_id = f"{namespaceMap}{projectID}-file-concluded-{fileid}"
-                            
-                            # Create the license expression node if needed
-                            if len(file_license_expressions) > 1 and file_license_expr_spdx_id not in added_spdx_ids:
-                                file_license_expr_node = {
-                                    "spdxId": file_license_expr_spdx_id,
-                                    "type": "simplelicensing_LicenseExpression",
-                                    "simplelicensing_licenseExpression": file_license_expression,
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(file_license_expr_node)
-                                added_spdx_ids.add(file_license_expr_spdx_id)
-                            
-                            # Create hasConcludedLicense relationship from package to file licenses
-                            license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-file-{fileid}-concluded"
-                            if license_rel_spdx_id not in added_spdx_ids:
-                                # Use the expression node if multiple licenses, otherwise the single license
-                                target_license_id = file_license_expr_spdx_id if len(file_license_expressions) > 1 else f"{namespaceMap}{projectID}-{file_license_expressions[0]}"
-                                
-                                package_file_license_relationship_node = {
-                                    "spdxId": license_rel_spdx_id,
-                                    "type": "Relationship",
-                                    "relationshipType": "hasConcludedLicense",
-                                    "from": inventoryLink,
-                                    "to": [target_license_id],
-                                    "comment": f"License concluded from file-level analysis of {fileName}",
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(package_file_license_relationship_node)
-                                added_spdx_ids.add(license_rel_spdx_id)
+        # Create empty dictionary for project level data for this project
+        projectData[projectName] = {}
 
-                    # Only add relationship if spdxId is unique
-                    rel_spdx_id = package_relationship_file_node["spdxId"]
-                    if rel_spdx_id not in added_spdx_ids:
-                        reportDetails["@graph"].append(package_relationship_file_node)
-                        added_spdx_ids.add(rel_spdx_id)
+        #############################################
+        #  This area will be replaced by 2020R4 APIs
+        numApproved = 0
+        numRejected = 0
+        numDraft = 0
+        currentItem=0
+
+        for inventoryItem in projectInventorySummary:
+            currentItem +=1
+
+            complianceIssues = {}
+
+            inventoryID = inventoryItem["id"]
+            inventoryItemName = inventoryItem["name"]
+
+            logger.debug("Processing inventory items %s of %s" %(currentItem, len(projectInventorySummary)))
+            logger.debug("    Project:  %s   Inventory Name: %s  Inventory ID: %s" %(projectName, inventoryItemName, inventoryID))
             
-            inventoryAssociatedRemoteScannedFiles = report_data_db.get_remote_scanned_files(projectID, inventoryID)
-            if inventoryAssociatedRemoteScannedFiles is not None:
-                for inventoryAssociatedFile in inventoryAssociatedRemoteScannedFiles:
-                    fileHashes.append(inventoryAssociatedFile.get("fileSHA1"))
-                    fileid = inventoryAssociatedFile['fileId']
-                    fileName = inventoryAssociatedFile["filePath"].split("/")[-1]
-                    file_spdx_id = f"{namespaceMap}ProjectId-{projectID}-FileId-{fileid}-remote"
-                    
-                    # Get copyright info for this remote file
-                    fileCopyright = " | ".join(sorted(list(set(report_data_db.get_project_copyright_evidence(projectID, fileid)))))
-                    
-                    # Also collect for inventory-level aggregation
-                    inventoryCopyrights.extend(report_data_db.get_project_copyright_evidence(projectID, fileid))
-                    
-                    # Only add if this spdxId hasn't been added before
-                    if file_spdx_id not in added_spdx_ids:
-                        package_file_associated_node = {
-                            "spdxId": file_spdx_id,
-                            "type": "software_File",
-                            "software_copyrightText": fileCopyright,
-                            "name": fileName,
-                            "software_primaryPurpose": "source",
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(package_file_associated_node)
-                        added_spdx_ids.add(file_spdx_id)
-                    
-                    package_relationship_file_node = {
-                        "spdxId": f"{namespaceMap}{inventoryItemName}-{fileName}-remote",
-                        "type": "Relationship",
-                        "relationshipType": "contains",
-                        "from": inventoryLink,
-                        "to": [file_spdx_id],
-                        "creationInfo": "_:creationInfo_0"
-                    }
-                    # Only add relationship if spdxId is unique
-                    rel_spdx_id = package_relationship_file_node["spdxId"]
-                    if rel_spdx_id not in added_spdx_ids:
-                        reportDetails["@graph"].append(package_relationship_file_node)
-                        added_spdx_ids.add(rel_spdx_id)
-            # Create a hash of the file hashes for PackageVerificationCode 
+            componentName = inventoryItem["componentName"]
+            componentID = inventoryItem["componentId"]
+            componentVersionId = inventoryItem.get("componentVersionId", "")
+            inventoryPriority = inventoryItem["priority"]
+            componentVersionName = inventoryItem["componentVersionName"]
+            selectedLicenseID = inventoryItem["selectedLicenseId"]
+            selectedLicenseName = inventoryItem["selectedLicenseSPDXIdentifier"]
+
+            # Sentinel values Code Insight uses when no single license is selected
+            # (WIP, Unknown, or a multi-license expression item)
+            isSentinelLicenseID = str(selectedLicenseID) in ("N/A", "-1", "-2", "69")
+
+            if selectedLicenseID in licenseDetails.keys():
+                selectedLicenseName = licenseDetails[selectedLicenseID]["selectedLicenseName"]
+                selectedLicenseUrl = licenseDetails[selectedLicenseID]["selectedLicenseUrl"]
+                selectedLicensePriority = licenseDetails[selectedLicenseID]["selectedLicensePriority"]
+            else:
+                if not isSentinelLicenseID:
+                    logger.debug("        Fetching license details for %s with ID %s" %(selectedLicenseName, selectedLicenseID))
+                    licenseInformation = common.api.license.license_lookup.get_license_details(baseURL, selectedLicenseID, authToken)
+                    licenseURL = licenseInformation["url"]
+                    spdxIdentifier = licenseInformation["spdxIdentifier"]
+                    licensePriority = licenseInformation["priority"]
+
+                    if spdxIdentifier != "" and spdxIdentifier != "N/A":
+                        licenseName = spdxIdentifier
+                    else:
+                        licenseName = licenseInformation["shortName"]
+
+                    # There is not specific selected license just let it be blank
+                    if licenseName == "I don't know":
+                        licenseName = ""
+
+                    licenseDetails[selectedLicenseID] = {}
+                    licenseDetails[selectedLicenseID]["selectedLicenseName"] = licenseName
+                    licenseDetails[selectedLicenseID]["selectedLicenseUrl"] = licenseURL
+                    licenseDetails[selectedLicenseID]["selectedLicensePriority"] = licensePriority
+
+                    selectedLicenseName = licenseName
+                    selectedLicenseUrl = licenseURL
+                    selectedLicensePriority = licensePriority
+
+                else:
+                    # Typically a WIP item
+                    selectedLicenseName = ""
+                    selectedLicenseUrl = ""
+                    selectedLicensePriority = ""
+
+            # For sentinel-ID items, check /inventories/{id} for its license expression
+            # (e.g. "MIT OR Apache-2.0"). Not cached: a single component version can
+            # legitimately have different license expressions across different
+            # inventory items, so the expression must be fetched per inventory item.
+            licenseExpression = ""
+            if isSentinelLicenseID:
+                try:
+                    inventoryItemDetails = common.api.inventory.get_inventory_details.get_inventory_item_details_no_vuln_data(inventoryID, baseURL, authToken)
+                    licenseExpressionDetails = inventoryItemDetails.get("licenseExpressionDetails")
+                    if licenseExpressionDetails:
+                        licenseExpression = licenseExpressionDetails.get("licenseExpression", "") or ""
+                except:
+                    logger.warning("Unable to fetch license expression for inventory item %s." %inventoryItemName)
+
+            # Prefer a resolved license expression over the single-license name
+            if licenseExpression:
+                selectedLicenseName = licenseExpression
+                selectedLicenseUrl = ""
+
+            # If there is no specific version just leave it blank
+            if componentVersionName == "N/A":
+                componentVersionName = ""
+            
+            componentUrl = inventoryItem["url"]
+            inventoryReviewStatus = inventoryItem["reviewStatus"] 
+            inventoryLink = baseURL + "/codeinsight/FNCI#myprojectdetails/?id=" + str(projectID) + "&tab=projectInventory&pinv=" + str(inventoryID)
+
             try:
-                stringHash = ''.join(sorted(fileHashes))
+                if cvssVersion == "3.x":
+                    vulnerabilities = inventoryItem["vulnerabilitySummary"][0]["CvssV3"]
+                else:
+                    vulnerabilities = inventoryItem["vulnerabilitySummary"][0]["CvssV2"]
+                vulnerabilityData = create_inventory_summary_dict(vulnerabilities, cvssVersion)
             except:
-                logger.error("Failure sorting file hashes for %s" %inventoryItemName)
-                logger.debug(stringHash)
-                stringHash = ''.join(fileHashes)
-            
-            packageVerificationCodeValue = (hashlib.sha1(stringHash.encode('utf-8'))).hexdigest()
-            
-            # Format inventory copyrights as pipe-separated string
-            if inventoryCopyrights:
-                # Remove duplicates and filter out empty values
-                unique_copyrights = [c for c in set(inventoryCopyrights) if c and c.strip()]
-                if unique_copyrights:
-                    inventoryCopyrightsFormatted = " | ".join(sorted(unique_copyrights))
+                logger.debug("No vulnerabilies for %s - %s" %(componentName, componentVersionName))
+                vulnerabilityData = {'numTotalVulnerabilities': 0, 'numCriticalVulnerabilities': 0, 'numHighVulnerabilities': 0, 'numMediumVulnerabilities': 0, 'numLowVulnerabilities': 0, 'numNoneVulnerabilities': 0}
+
+            # # If there is a SPDX value use that otherwise use the full name based on the             
+            # if selectedLicenseSPDXIdentifier == "":
+            #     selectedLicenseName = selectedLicenseID
+            # else:
+            #     selectedLicenseName = selectedLicenseSPDXIdentifier
+
+            ############################################################################################
+            # Determine if there are any compliance issues to report on
+            if includeComplianceInformation:
+                
+                # Check review status
+                if inventoryReviewStatus == "Rejected":
+                    complianceIssues["Item rejected"] = "This item has been rejected for use. Please consult with your legal and/or security team for further guidance."
+                elif inventoryReviewStatus == "Draft":
+                    complianceIssues["Item not reviewed"] =  "This item has not been reviewed for use. Please consult with your legal and/or security team for further guidance."
+
+
+                # Check if there is vulnerability data
+                if sum(vulnerabilityData.values()) > 0:
+                    complianceIssues["Security vulnerabilities"] = "This item has associated security vulnerabilites. Please consult with your security team for further guidance."
+
+                
+                # License compliance issue
+                if selectedLicensePriority == 1:
+                    complianceIssues["P1 license"] = "This item has a viral or strong copyleft license. Depnding on your usage there may be additional oblilgations. Please consult with your legal team.."
+
+                # Component version compliance issue
+                if componentVersionName == "":
+                    complianceIssues["Unknown version"] = "This item has an unknown version. Additional analysis is recommended."
                 else:
-                    inventoryCopyrightsFormatted = "NOASSERTION"
-            else:
-                inventoryCopyrightsFormatted = "NOASSERTION"
-            
-            # Handle componentName safely - some inventory items might not have it (e.g., License Only)
-            componentName = inventoryItem.get("componentName", inventoryItem.get("inventoryItemName", "Unknown")).strip()
-            forge = inventoryItem.get("forge", "")
-            
-            # Create supplier organization entity
-            supplier_string = create_supplier_string(forge, componentName)
-            supplier_spdx_id = f"{namespaceMap}{projectID}-{supplier_string.replace('Organization: ', '').replace(':', '-').replace(' ', '-')}"
-            
-            # Only add supplier organization if not already added
-            if supplier_spdx_id not in added_spdx_ids:
-                supplier_name = supplier_string.replace("Organization: ", "").strip()
-                if  supplier_name == "Undetermined":
-                    supplier_name = "unknown provenance"
-                supplier_node = {
-                    "spdxId": supplier_spdx_id,
-                    "type": "Organization",
-                    "name": supplier_name,
-                    "creationInfo": "_:creationInfo_0"
-                }
-                reportDetails["@graph"].append(supplier_node)
-                added_spdx_ids.add(supplier_spdx_id)
-            
-            # Handle componentDescription safely - some inventory items might not have it
-            componentDescription = inventoryItem.get("componentDescription")
-            if componentDescription is not None:
-                componentDescription = componentDescription.replace("\n", " - ")
-                usageText = inventoryItem.get("usageText")
-                if usageText is not None:
-                    componentDescription += " - " + usageText
-            else:
-                componentDescription = ""
-            componentDescription = (
-                unicodedata.normalize("NFKD", componentDescription)
-                .encode("ASCII", "ignore")
-                .decode("utf-8")
-            )
-            package_node = {
-                "spdxId": inventoryLink,
-                "type": "software_Package",
-                "software_copyrightText" : inventoryCopyrightsFormatted,
-                "suppliedBy" : supplier_spdx_id,
-                "verifiedUsing": [
-                    {
-                    "type": "PackageVerificationCode",
-                    "algorithm": "sha1",
-                    "hashValue": packageVerificationCodeValue
-                    }
-                ],
-                "name":  project_Name + "-"+ componentName,
-                "software_downloadLocation": inventoryItem.get("componentUrl") if inventoryItem.get("componentUrl") is not None else inventoryItem.get("selectedLicenseUrl", "NOASSERTION"),
-                "software_packageVersion" : inventoryItem.get("componentVersionName") if inventoryItem.get("componentVersionName") is not None else "N/A",
-                "description" : componentDescription,
-                "creationInfo": "_:creationInfo_0"
+                    if componentID == "55720":  # Is it the linux kernel?
+                        # The API call for the versions of linux takes a long time due to teh massive number of versions so bypass
+                        logger.debug("Linux kernel so skipping version analysis")
+                        complianceIssues["Version not analyzed"] = "This versions for this component have not beeen analyzed. Manual inspection is suggested"
+                    elif componentID == "6682478":  # Is it the vim-vim?
+                        # The API call for the versions of vim-vim takes a long time due to the massive number of versions so bypass
+                        logger.debug("vim-vim so skipping version analysis")
+                        complianceIssues["Version not analyzed"] = "This versions for this component have not beeen analyzed. Manual inspection is suggested"
+                    else:
+                    #    Determine if there are any issues with the version
+                        componentVersionDetails = getVersionDetails(componentVersionName, componentID, baseURL, authToken)
+                        numberVersionsBack = componentVersionDetails["numberVersionsBack"]
+
+                        if int(numberVersionsBack) >= int(maxVersionsBack):
+                            latestVersion = componentVersionDetails["latestVersion"]
+                            complianceIssues["Old version"] = "The latest version is " + latestVersion + ". Your version is " + str(numberVersionsBack) + " versions back from the latest version. You should consider upgrading to a more recent version of this component."
+                        elif numberVersionsBack == -1:
+                            complianceIssues["Invalid Version"] = componentVersionName + " is not a valid version for the current component." 
+                
+                # Was there a license selected?
+                if selectedLicenseName == "":
+                    complianceIssues["Unspecified license"] = "This item has does not have a license associated with it. Additional analysis is recommended."
+
+
+            # Store the data for the inventory item for reporting
+            inventoryData[inventoryID] = {
+                "projectName" : projectName,
+                "inventoryItemName" : inventoryItemName,
+                "componentName" : componentName,
+                "componentVersionName" : componentVersionName,
+                "selectedLicenseName" : selectedLicenseName,
+                "vulnerabilityData" : vulnerabilityData,
+                "inventoryPriority" : inventoryPriority,
+                "componentUrl" : componentUrl,
+                "selectedLicenseUrl" : selectedLicenseUrl,
+                "inventoryReviewStatus" : inventoryReviewStatus,
+                "inventoryLink" : inventoryLink,
+                "projectLink" : projectLink,
+                "complianceIssues" : complianceIssues
             }
-            
-            # Only add package if spdxId is unique
-            if inventoryLink not in added_spdx_ids:
-                reportDetails["@graph"].append(package_node)
-                added_spdx_ids.add(inventoryLink)
 
-            # Add all custom inventory fields as SPDX 3.x Annotation nodes (one per field)
-            custom_fields = report_data_db.get_all_custom_field_values(inventoryID)
-            for custom_field in custom_fields:
-                field_label = custom_field["label"]
-                field_value = custom_field["value"]
-                safe_label = re.sub(r'[^a-zA-Z0-9]', '-', field_label)
-                annotation_spdx_id = f"{namespaceMap}Annotation-{safe_label}-{inventoryID}"
-                if annotation_spdx_id not in added_spdx_ids:
-                    annotation_node = {
-                        "spdxId": annotation_spdx_id,
-                        "type": "Annotation",
-                        "annotationType": "other",
-                        "subject": inventoryLink,
-                        "statement": f"{field_label}: {field_value}",
-                        "creationInfo": "_:creationInfo_0"
-                    }
-                    reportDetails["@graph"].append(annotation_node)
-                    added_spdx_ids.add(annotation_spdx_id)
+            #############################################
+            # Sum up inventory review status data
+            if inventoryReviewStatus == "Approved":
+                numApproved += 1
+            elif inventoryReviewStatus == "Rejected":
+                numRejected += 1
+            elif inventoryReviewStatus == "Draft":
+                numDraft += 1
+            else:
+                logger.error("Unknown inventoryReview Status: %s" %inventoryReviewStatus)
 
-            # Process package-level licenses (declared licenses from component metadata)
-            # Per SPDX 3.0.1: hasDeclaredLicense = license info found IN the package itself
-            # (e.g., LICENSE file, README, package metadata, manifest files)
-            componentId = inventoryItem.get("componentId")
-            declared_license_ids = []  # Track declared licenses for comparison
-            
-            if componentId is not None:
-                possibleLicenses = report_data_db.get_component_possible_Licenses(componentId)
-                if possibleLicenses is not None and isinstance(possibleLicenses, list) and len(possibleLicenses) > 0:
-                    # Collect all declared license identifiers for potential OR expression
-                    declared_licenses_for_expression = []
-                    
-                    for license in possibleLicenses:
-                        licenseName = license.get("licenseName")
-                        
-                        # Determine possibleLicenseSPDXIdentifier based on available fields
-                        if license.get("spdxIdentifier") is None and license.get("shortName") != "" and license.get("shortName") is not None:
-                            possibleLicenseSPDXIdentifier = license["shortName"]
-                        elif license.get("spdxIdentifier") is not None:
-                            possibleLicenseSPDXIdentifier = license["spdxIdentifier"]
-                        else:
-                            possibleLicenseSPDXIdentifier = licenseName
-                        
-                        # Handle Public Domain as NONE
-                        if licenseName == "Public Domain":
-                            logger.info("        Added to NONE declaredLicenses since Public Domain.")
-                            license_spdx_id = f"{namespaceMap}{projectID}-NONE"
-                            declared_license_ids.append(license_spdx_id)
-                            declared_licenses_for_expression.append("NONE")
-                            
-                            if license_spdx_id not in added_spdx_ids:
-                                none_license_node = {
-                                    "spdxId": license_spdx_id,
-                                    "type": "simplelicensing_LicenseExpression",
-                                    "simplelicensing_licenseExpression": "NONE",
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(none_license_node)
-                                added_spdx_ids.add(license_spdx_id)
-                        
-                        # Check if license is in SPDX mappings
-                        elif possibleLicenseSPDXIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
-                            logger.info("        \"%s\" maps to SPDX ID: \"%s\"" % (possibleLicenseSPDXIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]))
-                            spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[possibleLicenseSPDXIdentifier]
-                            license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
-                            declared_license_ids.append(license_spdx_id)
-                            declared_licenses_for_expression.append(spdx_mapped_license)
-                            
-                            if license_spdx_id not in added_spdx_ids:
-                                license_node = {
-                                    "spdxId": license_spdx_id,
-                                    "type": "simplelicensing_LicenseExpression",
-                                    "simplelicensing_licenseExpression": spdx_mapped_license,
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(license_node)
-                                added_spdx_ids.add(license_spdx_id)
-                        
-                        else:
-                            # License not in SPDX mappings - create CustomLicense with LicenseRef
-                            logger.warning("        \"%s\" is not a valid SPDX identifier for Declared License. - Using LicenseRef." % (possibleLicenseSPDXIdentifier))
-                            
-                            # Clean up the identifier
-                            possibleLicenseSPDXIdentifier = possibleLicenseSPDXIdentifier.split("(", 1)[0].rstrip()  # Remove everything after (
-                            possibleLicenseSPDXIdentifier = re.sub('[^a-zA-Z0-9 \n\.]', '-', possibleLicenseSPDXIdentifier)  # Replace special chars with dash
-                            possibleLicenseSPDXIdentifier = possibleLicenseSPDXIdentifier.replace(" ", "-")  # Replace space with dash
-                            licenseReference = "LicenseRef-%s" % possibleLicenseSPDXIdentifier
-                            
-                            # Priority: noticeText > asFoundLicenseText > possibleLicenseSPDXIdentifier
-                            extractedText = (inventoryItem.get("noticeText") or 
-                                           inventoryItem.get("asFoundLicenseText") or 
-                                           possibleLicenseSPDXIdentifier)
-                            
-                            custom_license_spdx_id = f"{namespaceMap}{licenseReference}"
-                            declared_license_ids.append(custom_license_spdx_id)
-                            declared_licenses_for_expression.append(licenseReference)
-                            
-                            # Create CustomLicense element (SPDX 3.x equivalent of hasExtractedLicensingInfos)
-                            if custom_license_spdx_id not in added_spdx_ids:
-                                custom_license_node = {
-                                    "spdxId": custom_license_spdx_id,
-                                    "type": "expandedlicensing_CustomLicense",
-                                    "simplelicensing_licenseText": extractedText,
-                                    "name": possibleLicenseSPDXIdentifier,
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                reportDetails["@graph"].append(custom_license_node)
-                                added_spdx_ids.add(custom_license_spdx_id)
-                    
-                    # Create hasDeclaredLicense relationship with proper license expression
-                    # Multiple licenses typically represent alternatives (OR) not conjunctions (AND)
-                    if declared_license_ids:
-                        license_expression = create_license_expression(declared_licenses_for_expression, use_or=True)
-                        license_expr_spdx_id = f"{namespaceMap}{projectID}-declared-{inventoryID}"
-                        
-                        if license_expr_spdx_id not in added_spdx_ids:
-                            license_expr_node = {
-                                "spdxId": license_expr_spdx_id,
-                                "type": "simplelicensing_LicenseExpression",
-                                "simplelicensing_licenseExpression": license_expression,
-                                "creationInfo": "_:creationInfo_0"
-                            }
-                            reportDetails["@graph"].append(license_expr_node)
-                            added_spdx_ids.add(license_expr_spdx_id)
-                        
-                        # Create hasDeclaredLicense relationship
-                        declared_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-declared-{inventoryID}"
-                        if declared_rel_spdx_id not in added_spdx_ids:
-                            declared_license_relationship_node = {
-                                "spdxId": declared_rel_spdx_id,
-                                "type": "Relationship",
-                                "relationshipType": "hasDeclaredLicense",
-                                "from": inventoryLink,
-                                "to": [license_expr_spdx_id],
-                                "creationInfo": "_:creationInfo_0"
-                            }
-                            reportDetails["@graph"].append(declared_license_relationship_node)
-                            added_spdx_ids.add(declared_rel_spdx_id)
+        # Group all inventory based data into a dict wit the project name as the key
+        projectData[projectName]["numApproved"] = numApproved
+        projectData[projectName]["numRejected"] = numRejected
+        projectData[projectName]["numDraft"] = numDraft
+        projectData[projectName]["numP1Licenses"] = projectInformation["licenses"]["P1"]
+        projectData[projectName]["numP2Licenses"] = projectInformation["licenses"]["P2"]
+        projectData[projectName]["numP3Licenses"] = projectInformation["licenses"]["P3"]
+        projectData[projectName]["numNALicenses"] = projectInformation["licenses"]["Unknown"]
 
-            # Process inventory-specific selected license (concluded license based on user determination)
-            # Per SPDX 3.0.1: hasConcludedLicense = license determined by SPDX data creator
-            # after analyzing the software artifact and other information
-            selectedLicenseName = inventoryItem.get("selectedLicenseName")
-            selectedLicenseSPDXIdentifier = inventoryItem.get("selectedLicenseSPDXIdentifier")
-            shortName = inventoryItem.get("shortName")
-            concluded_license_spdx_id = None  # Track for comparison with declared
-            
-            if selectedLicenseName is not None and selectedLicenseName != "":
-                # Determine the SPDX identifier to use
-                if selectedLicenseSPDXIdentifier is not None and selectedLicenseSPDXIdentifier != "":
-                    selectedIdentifier = selectedLicenseSPDXIdentifier
-                elif shortName is not None and shortName != "":
-                    selectedIdentifier = shortName
-                else:
-                    selectedIdentifier = selectedLicenseName
-                
-                # Prepare comment if concluded differs from declared
-                concluded_comment = None
-                
-                # Handle Public Domain as NONE
-                if selectedLicenseName == "Public Domain":
-                    logger.info("        Added to NONE concludedLicense for selected license since Public Domain.")
-                    concluded_license_spdx_id = f"{namespaceMap}{projectID}-NONE"
-                    concluded_expression = "NONE"
-                    
-                    if concluded_license_spdx_id not in added_spdx_ids:
-                        none_license_node = {
-                            "spdxId": concluded_license_spdx_id,
-                            "type": "simplelicensing_LicenseExpression",
-                            "simplelicensing_licenseExpression": "NONE",
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(none_license_node)
-                        added_spdx_ids.add(concluded_license_spdx_id)
-                
-                # Check if license is in SPDX mappings
-                elif selectedIdentifier in SPDX_license_mappings.LICENSEMAPPINGS:
-                    logger.info("        Selected license \"%s\" maps to SPDX ID: \"%s\"" % (selectedIdentifier, SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]))
-                    spdx_mapped_license = SPDX_license_mappings.LICENSEMAPPINGS[selectedIdentifier]
-                    concluded_license_spdx_id = f"{namespaceMap}{projectID}-{spdx_mapped_license}"
-                    concluded_expression = spdx_mapped_license
-                    
-                    if concluded_license_spdx_id not in added_spdx_ids:
-                        license_node = {
-                            "spdxId": concluded_license_spdx_id,
-                            "type": "simplelicensing_LicenseExpression",
-                            "simplelicensing_licenseExpression": spdx_mapped_license,
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(license_node)
-                        added_spdx_ids.add(concluded_license_spdx_id)
-                
-                else:
-                    # License not in SPDX mappings - create CustomLicense with LicenseRef
-                    logger.warning("        Selected license \"%s\" is not a valid SPDX identifier. - Using LicenseRef." % (selectedIdentifier))
-                    
-                    # Clean up the identifier
-                    cleanedIdentifier = selectedIdentifier.split("(", 1)[0].rstrip()  # Remove everything after (
-                    cleanedIdentifier = re.sub('[^a-zA-Z0-9 \n\.]', '-', cleanedIdentifier)  # Replace special chars with dash
-                    cleanedIdentifier = cleanedIdentifier.replace(" ", "-")  # Replace space with dash
-                    licenseReference = "LicenseRef-%s" % cleanedIdentifier
-                    
-                    # Priority: noticeText > asFoundLicenseText > selectedIdentifier
-                    extractedText = (inventoryItem.get("noticeText") or 
-                                   inventoryItem.get("asFoundLicenseText") or 
-                                   selectedIdentifier)
-                    
-                    concluded_license_spdx_id = f"{namespaceMap}{licenseReference}"
-                    concluded_expression = licenseReference
-                    
-                    # Create CustomLicense element
-                    if concluded_license_spdx_id not in added_spdx_ids:
-                        custom_license_node = {
-                            "spdxId": concluded_license_spdx_id,
-                            "type": "expandedlicensing_CustomLicense",
-                            "simplelicensing_licenseText": extractedText,
-                            "name": cleanedIdentifier,
-                            "creationInfo": "_:creationInfo_0"
-                        }
-                        reportDetails["@graph"].append(custom_license_node)
-                        added_spdx_ids.add(concluded_license_spdx_id)
-                
-                # Check if concluded license differs from declared licenses
-                # Per SPDX 3.0.1: If concluded != declared, a written explanation SHOULD be provided
-                if declared_license_ids and concluded_license_spdx_id not in declared_license_ids:
-                    concluded_comment = f"Concluded license '{concluded_expression}' selected from available declared licenses based on analysis and user determination."
-                
-                # Create hasConcludedLicense relationship
-                license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-concluded-selected-{inventoryID}"
-                if license_rel_spdx_id not in added_spdx_ids:
-                    license_relationship_node = {
-                        "spdxId": license_rel_spdx_id,
-                        "type": "Relationship",
-                        "relationshipType": "hasConcludedLicense",
-                        "from": inventoryLink,
-                        "to": [concluded_license_spdx_id],
-                        "creationInfo": "_:creationInfo_0"
-                    }
-                    # Add comment if concluded differs from declared
-                    if concluded_comment:
-                        license_relationship_node["comment"] = concluded_comment
-                    
-                    reportDetails["@graph"].append(license_relationship_node)
-                    added_spdx_ids.add(license_rel_spdx_id)
+        # Determine the state of the project based on the "worst" status of inventory
+        if numRejected > 0:
+            project.update({"projectReviewStatus": "Rejected"})
+            projectReviewStatus[projectID] = "Rejected"
+        elif numDraft > 0:
+            project.update({"projectReviewStatus": "Draft"})
+            projectReviewStatus[projectID] = "Draft"
+        else:
+            project.update({"projectReviewStatus": "Approved"})
+            projectReviewStatus[projectID] = "Approved"
 
-            # add dependency relationship if applicable at package level
-            if inventoryItem.get("parentInventory") is not None:
-                parentPackageID = inventoryItem.get("parentInventory")
-                if inventoryItem.get("dependencyScope") == 0:
-                    scope = "runtime"
-                else:
-                    scope = "build"
+        if cvssVersion == "3.x":
+            projectData[projectName]["numCriticalVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV3"]["Critical"]
+            projectData[projectName]["numHighVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV3"]["High"]
+            projectData[projectName]["numMediumVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV3"]["Medium"]
+            projectData[projectName]["numLowVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV3"]["Low"]
+            projectData[projectName]["numNoneVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV3"]["None"]
+        else:
+            projectData[projectName]["numHighVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV2"]["High"]
+            projectData[projectName]["numMediumVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV2"]["Medium"]
+            projectData[projectName]["numLowVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV2"]["Low"]
+            projectData[projectName]["numNoneVulnerabilities"] = projectInformation["vulnerabilities"]["CvssV2"]["Unknown"]
 
-                parent_rel_spdx_id = f"{namespaceMap}{parentPackageID}-isParentRelOf-{inventoryID}"
-                
-                parent_relationship_node = {
-                    "spdxId" : parent_rel_spdx_id,
-                    "type" : "LifecycleScopedRelationship",
-                    "relationshipType" : "dependsOn",
-                    "scope" : scope,
-                    "to" : [ f"{namespaceMap}ProjectId-{projectID}-InventoryId-{parentPackageID}" ],
-                    "from" : inventoryLink,
-                    "creationInfo" : "_:creationInfo_0"
-                }
-                if parent_rel_spdx_id not in added_spdx_ids:
-                    reportDetails["@graph"].append(parent_relationship_node)
-                    added_spdx_ids.add(parent_rel_spdx_id)
+        projectData[projectName]["projectLink"] = projectLink
 
-            # Process vulnerabilities for this component
-            # Per SPDX 3.0.1: Vulnerability class represents security vulnerabilities
-            component_version_id = inventoryItem.get("component_version_id")
-            if component_version_id is not None:
-                vulnerabilities = report_data_db.get_component_version_vdr_vulnerabilities(projectID, component_version_id)
-                
-                if vulnerabilities is not None and isinstance(vulnerabilities, list) and len(vulnerabilities) > 0:
-                    for vuln in vulnerabilities:
-                        vuln_id = vuln.get("vulnerabilityId")
-                        vuln_name = vuln.get("vulnerabilityName")
-                        
-                        if vuln_name:
-                            # Create unique SPDX ID for vulnerability
-                            vuln_spdx_id = f"{namespaceMap}Vulnerability-{vuln_name}"
-                            
-                            # Only add vulnerability if not already added
-                            if vuln_spdx_id not in added_spdx_ids:
-                                # Build vulnerability node according to SPDX 3.0.1
-                                vulnerability_node = {
-                                    "spdxId": vuln_spdx_id,
-                                    "type": "security_Vulnerability",
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                
-                                # Add description
-                                vuln_desc = vuln.get("vulnerabilityDescription")
-                                if vuln_desc:
-                                    vulnerability_node["description"] = vuln_desc
-                                
-                                # Add summary (brief description)
-                                if vuln_desc:
-                                    # Create a summary - first sentence or first 100 chars
-                                    summary = vuln_desc.split('.')[0] if '.' in vuln_desc else vuln_desc[:100]
-                                    vulnerability_node["summary"] = summary
-                                
-                                # Add externalIdentifier for CVE
-                                if vuln_name:
-                                    external_id = {
-                                        "type": "ExternalIdentifier",
-                                        "identifier": vuln_name,
-                                        "externalIdentifierType": "cve"
-                                    }
-                                    # Add CVE locator URL if this is a CVE identifier
-                                    if vuln_name.startswith("CVE-"):
-                                        external_id["identifierLocator"] = [f"https://www.cve.org/CVERecord?id={vuln_name}"]
-                                    vulnerability_node["externalIdentifier"] = [external_id]
-                                
-                                # Add externalRef for advisory URLs
-                                external_refs = []
-                                if vuln.get("vulnerabilityUrl"):
-                                    external_refs.append({
-                                        "type": "ExternalRef",
-                                        "locator": [vuln.get("vulnerabilityUrl")],
-                                        "externalRefType": "securityAdvisory"
-                                    })
-                                if external_refs:
-                                    vulnerability_node["externalRef"] = external_refs
-                                
-                                # Add published date - convert MM/DD/YYYY to ISO format
-                                if vuln.get("publishedDate"):
-                                    try:
-                                        pub_date = vuln.get("publishedDate")
-                                        # Parse MM/DD/YYYY and convert to ISO format
-                                        dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
-                                        vulnerability_node["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                    except:
-                                        pass
-                                
-                                # Add vulnerability node to report
-                                reportDetails["@graph"].append(vulnerability_node)
-                                added_spdx_ids.add(vuln_spdx_id)
-                            
-                            # Create relationship from package to vulnerability
-                            vuln_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-hasVulnerability-{vuln_name}"
-                            if vuln_rel_spdx_id not in added_spdx_ids:
-                                vulnerability_relationship = {
-                                    "spdxId": vuln_rel_spdx_id,
-                                    "type": "Relationship",
-                                    "relationshipType": "hasAssociatedVulnerability",
-                                    "from": inventoryLink,
-                                    "to": [vuln_spdx_id],
-                                    "creationInfo": "_:creationInfo_0"
-                                }
-                                
-                                reportDetails["@graph"].append(vulnerability_relationship)
-                                added_spdx_ids.add(vuln_rel_spdx_id)
-                            
-                            # Create CVSS v4 assessment relationship - score, severity and vectorString are all required (1..1) by the spec,
-                            # so only emit when vector+score are both present (severity is derived from score if not supplied)
-                            if vuln.get("vulnerabilityCvssV4Vector") and vuln.get("vulnerabilityCvssV4Score"):
-                                cvssv4_severity = vuln.get("vulnerabilityCvssV4Severity")
-                                cvssv4_severity = cvssv4_severity.lower() if cvssv4_severity else derive_cvss_severity(vuln.get("vulnerabilityCvssV4Score"))
-                                if cvssv4_severity:
-                                    cvssv4_rel_spdx_id = f"{namespaceMap}CvssV4Assessment-{vuln_name}-{inventoryItemName}"
-                                    if cvssv4_rel_spdx_id not in added_spdx_ids:
-                                        cvssv4_assessment = {
-                                            "spdxId": cvssv4_rel_spdx_id,
-                                            "type": "security_CvssV4VulnAssessmentRelationship",
-                                            "relationshipType": "hasAssessmentFor",
-                                            "from": vuln_spdx_id,
-                                            "to": [inventoryLink],
-                                            "security_assessedElement": inventoryLink,
-                                            "security_score": str(vuln.get("vulnerabilityCvssV4Score")),
-                                            "security_vectorString": vuln.get("vulnerabilityCvssV4Vector"),
-                                            "security_severity": cvssv4_severity,
-                                            "creationInfo": "_:creationInfo_0"
-                                        }
-                                        
-                                        # Add published time
-                                        if vuln.get("publishedDate"):
-                                            try:
-                                                pub_date = vuln.get("publishedDate")
-                                                dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
-                                                cvssv4_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                            except:
-                                                pass
-                                        
-                                        reportDetails["@graph"].append(cvssv4_assessment)
-                                        added_spdx_ids.add(cvssv4_rel_spdx_id)
-                            
-                            # Create CVSS v3 assessment relationship - score, severity and vectorString are all required (1..1) by the spec,
-                            # so only emit when vector+score are both present (severity is derived from score if not supplied)
-                            if vuln.get("vulnerabilityCvssV3Vector") and vuln.get("vulnerabilityCvssV3Score"):
-                                cvssv3_severity = vuln.get("vulnerabilityCvssV3Severity")
-                                cvssv3_severity = cvssv3_severity.lower() if cvssv3_severity else derive_cvss_severity(vuln.get("vulnerabilityCvssV3Score"))
-                                if cvssv3_severity:
-                                    cvssv3_rel_spdx_id = f"{namespaceMap}CvssV3Assessment-{vuln_name}-{inventoryItemName}"
-                                    if cvssv3_rel_spdx_id not in added_spdx_ids:
-                                        cvssv3_assessment = {
-                                            "spdxId": cvssv3_rel_spdx_id,
-                                            "type": "security_CvssV3VulnAssessmentRelationship",
-                                            "relationshipType": "hasAssessmentFor",
-                                            "from": vuln_spdx_id,
-                                            "to": [inventoryLink],
-                                            "security_assessedElement": inventoryLink,
-                                            "security_vectorString": vuln.get("vulnerabilityCvssV3Vector"),
-                                            "security_score": str(vuln.get("vulnerabilityCvssV3Score")),
-                                            "security_severity": cvssv3_severity,
-                                            "creationInfo": "_:creationInfo_0"
-                                        }
-                                        
-                                        # Add published time
-                                        if vuln.get("publishedDate"):
-                                            try:
-                                                pub_date = vuln.get("publishedDate")
-                                                dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
-                                                cvssv3_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                            except:
-                                                pass
-                                        
-                                        reportDetails["@graph"].append(cvssv3_assessment)
-                                        added_spdx_ids.add(cvssv3_rel_spdx_id)
-                            
-                            # Create CVSS v2 assessment relationship - score and vectorString are both required (1..1) by the spec
-                            # (v2 has no severity property). Emitted independently of v3/v4 - SPDX models each CVSS version
-                            # as its own concrete relationship type.
-                            if vuln.get("vulnerabilityCvssV2Vector") and vuln.get("vulnerabilityCvssV2Score"):
-                                cvssv2_rel_spdx_id = f"{namespaceMap}CvssV2Assessment-{vuln_name}-{inventoryItemName}"
-                                if cvssv2_rel_spdx_id not in added_spdx_ids:
-                                    cvssv2_assessment = {
-                                        "spdxId": cvssv2_rel_spdx_id,
-                                        "type": "security_CvssV2VulnAssessmentRelationship",
-                                        "relationshipType": "hasAssessmentFor",
-                                        "from": vuln_spdx_id,
-                                        "to": [inventoryLink],
-                                        "security_assessedElement": inventoryLink,
-                                        "security_vectorString": vuln.get("vulnerabilityCvssV2Vector"),
-                                        "security_score": str(vuln.get("vulnerabilityCvssV2Score")),
-                                        "creationInfo": "_:creationInfo_0"
-                                    }
-                                    
-                                    # Add published time
-                                    if vuln.get("publishedDate"):
-                                        try:
-                                            pub_date = vuln.get("publishedDate")
-                                            dt = datetime.datetime.strptime(pub_date, "%m/%d/%Y")
-                                            cvssv2_assessment["security_publishedTime"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                                        except:
-                                            pass
-                                    
-                                    reportDetails["@graph"].append(cvssv2_assessment)
-                                    added_spdx_ids.add(cvssv2_rel_spdx_id)
+    # Roll up the inventortory data at a project level for display charts
+    projectSummaryData = create_project_summary_data_dict(projectData)
+    projectSummaryData["includeComplianceInformation"] = includeComplianceInformation
+    projectSummaryData["cvssVersion"] = cvssVersion
 
-    spdx_document_info_node = {
-      "spdxId": documentNamespace,
-      "type": "SpdxDocument",
-      "name":  project_Name + " SPDX Document",
-      "dataLicense": f"{namespaceMap}SPDXRef-CC0",
-      "rootElement": inventoryLinks,
-      "creationInfo": "_:creationInfo_0"
-    }
+    # Roll up the individual project data to the application level
+    applicationSummaryData = create_application_summary_data_dict(projectSummaryData)
 
-    cco_license_info_node={
-      "spdxId": f"{namespaceMap}SPDXRef-CC0",
-      "type": "simplelicensing_LicenseExpression",
-      "simplelicensing_licenseExpression": "CC0-1.0",
-      "creationInfo": "_:creationInfo_0"
-    }
+    # Roll up the project review status based on the status of child projects
+    projectReviewStatus = roll_up_project_review_level(projectHierarchy, projectReviewStatus, 1)
 
-    organization_info_node = {
-      "spdxId": f"{namespaceMap}SPDXRef-Organization-{creatorName}",
-      "type": "Organization",
-      "name": creatorName,
-      "creationInfo": "_:creationInfo_0"
-    }
-
-    # Only add nodes if their spdxIds are unique
-    if spdx_document_info_node["spdxId"] not in added_spdx_ids:
-        reportDetails["@graph"].append(spdx_document_info_node)
-        added_spdx_ids.add(spdx_document_info_node["spdxId"])
-    
-    if cco_license_info_node["spdxId"] not in added_spdx_ids:
-        reportDetails["@graph"].append(cco_license_info_node)
-        added_spdx_ids.add(cco_license_info_node["spdxId"])
-
-    if organization_info_node["spdxId"] not in added_spdx_ids:
-        reportDetails["@graph"].append(organization_info_node)
-        added_spdx_ids.add(organization_info_node["spdxId"])
-
+    # Build up the data to return for the
     reportData["topLevelProjectName"] = topLevelProjectName
-    reportData["reportDetails"] = reportDetails
-    reportData["projectList"] = projectList
+    reportData["projectHierarchy"] = projectHierarchy
+    reportData["projectName"] = projectHierarchy["name"]
+    reportData["projectID"] = projectHierarchy["id"]
+    reportData["inventoryData"] = inventoryData
+    reportData["projectList"] =projectList
+    reportData["projectSummaryData"] = projectSummaryData
+    reportData["applicationSummaryData"] = applicationSummaryData
+    reportData["projectInventoryCount"] = projectInventoryCount
+    reportData["totalInventoryCount"] = totalInventoryCount
+    reportData["projectReviewStatus"] = projectReviewStatus
+
+    logger.info("Exiting gather_data_for_report")
+
     return reportData
+  
+#----------------------------------------------------------------------
+def create_inventory_summary_dict(vulnerabilities,cvssVersion):
+    logger.info("Entering create_inventory_summary_dict")
+    
+    vulnerabilityData = {}
+    vulnerabilityData["numTotalVulnerabilities"] = sum(vulnerabilities.values())
 
-#-------------------------------------------------------
-def create_license_expression(licenses, use_or=True):
-    """
-    Create a proper SPDX license expression from a list of licenses.
+    vulnerabilityData["numHighVulnerabilities"] = vulnerabilities["High"]
+    vulnerabilityData["numMediumVulnerabilities"] = vulnerabilities["Medium"]
+    vulnerabilityData["numLowVulnerabilities"] = vulnerabilities["Low"]
+
+    if cvssVersion == "2.0":
+        vulnerabilityData["numNoneVulnerabilities"] = vulnerabilities["Unknown"]
+    elif cvssVersion == "3.x":
+        vulnerabilityData["numCriticalVulnerabilities"] = vulnerabilities["Critical"]
+        vulnerabilityData["numNoneVulnerabilities"] = vulnerabilities["None"]
+
+    return vulnerabilityData
+
+#----------------------------------------------#
+def create_project_hierarchy(project, parentID, projectList, baseURL):
+    logger.debug("Entering create_project_hierarchy")
+
+    # Are there more child projects for this project?
+    if len(project["childProject"]):
+
+        # Sort by project name of child projects
+        for childProject in sorted(project["childProject"], key = lambda i: i['name'] ) :
+
+            uniqueProjectID = str(parentID) + "-" + str(childProject["id"])
+            nodeDetails = {}
+            nodeDetails["projectID"] = childProject["id"]
+            nodeDetails["parent"] = parentID
+            nodeDetails["uniqueID"] = uniqueProjectID
+            nodeDetails["projectName"] = childProject["name"]
+            nodeDetails["projectLink"] = baseURL + "/codeinsight/FNCI#myprojectdetails/?id=" + str(childProject["id"]) + "&tab=projectInventory"
+
+            projectList.append( nodeDetails )
+
+            create_project_hierarchy(childProject, uniqueProjectID, projectList, baseURL)
+
+    return projectList
+
+
+#----------------------------------------------------------------------------------------#
+def create_project_summary_data_dict(projectData):
+    logger.debug("Entering get_project_summary_data")
+
+   # For the chart data we need to create lists where each element is in the correct order based on the 
+   # project name order.  i.e. one list will # of approved items for each project in the correct order
+    projectSummaryData = {}
+
+    # Create empty lists for each metric that we need for the report
+    for projectName in projectData:
+        for metric in projectData[projectName]:
+            if metric not in  ["P1InventoryItems", "projectLink"]:  # We don't care about these for now
+                projectSummaryData[metric] = []
+
+    # Grab the data for each project and add it in the correct order
+    for projectName in projectData:
+        for metric in projectData[projectName]:
+            if metric not in  ["P1InventoryItems", "projectLink", "cvssVersion"]:  # We don't care about these for now
+                projectSummaryData[metric].append(projectData[projectName][metric])
+
+    projectSummaryData["projectNames"] = list(projectData.keys())
     
-    Args:
-        licenses: List of license identifiers
-        use_or: If True, use OR operator (for license alternatives/choices)
-               If False, use AND operator (when both licenses apply)
+    logger.debug("Exiting get_project_summary_data")
+    return projectSummaryData
     
-    Returns:
-        String with proper SPDX license expression
-    """
-    if not licenses or len(licenses) == 0:
-        return None
-    
-    if len(licenses) == 1:
-        return licenses[0]
-    
-    # Remove duplicates while preserving order
-    unique_licenses = []
-    for lic in licenses:
-        if lic not in unique_licenses:
-            unique_licenses.append(lic)
-    
-    if len(unique_licenses) == 1:
-        return unique_licenses[0]
-    
-    # Use OR for alternatives (most common case - component offers choice of licenses)
-    # Use AND only when explicitly needed (both licenses apply simultaneously)
-    operator = " OR " if use_or else " AND "
-    
-    # Wrap each license in parentheses if it contains operators
-    formatted_licenses = []
-    for lic in unique_licenses:
-        if " OR " in lic or " AND " in lic:
-            formatted_licenses.append(f"({lic})")
+#----------------------------------------------------------------------------------------#
+def create_application_summary_data_dict(projectSummaryData):
+    logger.debug("Entering get_application_summary_data")
+
+    applicationSummaryData = {}
+
+    # For each metric sum the data up
+    for metric in projectSummaryData:
+        if metric == "cvssVersion":
+            applicationSummaryData[metric] = projectSummaryData[metric]
+
+        elif metric != "projectNames" and metric != "includeComplianceInformation":
+            applicationSummaryData[metric] = sum(projectSummaryData[metric])
+
+    logger.debug("Exiting get_application_summary_data")
+    return applicationSummaryData
+
+#----------------------------------------------------------------------------------------#
+def getVersionDetails(componentVersionName, componentID, baseURL, authToken):
+    logger.debug("Entering getVersionDetails")
+
+    componentVersionDetails = {}
+
+    # Is it a valid component
+    if componentID == "N/A":
+        return componentVersionDetails
+
+    versionDetails = common.api.component.get_component_details.get_component_details_v3_summary(baseURL, componentID, authToken)
+
+    componentVersionList = versionDetails["data"]["versionList"]
+
+    # Are there any versions?
+    if not len(componentVersionList):
+        return componentVersionDetails
+
+    componentVersions = [] # To hold just the version names that can be processed
+    ignoreVersions = ["unknown", "custom", "any version", "sample"]
+
+    # Extract just the version names for comparison purposes
+    for version in componentVersionList:
+        versionName = version["name"]
+
+        if versionName.lower() not in ignoreVersions:
+            componentVersions.append(versionName)
         else:
-            formatted_licenses.append(lic)
+            logger.warning("        The version %s is contained in the ingnoreVersions list" %versionName)
+
+    componentVersions.sort(key=natural_sort)
+
+    # In case there is a combination of version types 1.2 vs snapshot etc
+    # move the ones starting with text to the begining of the list
+    insertLocation = 0
+    for version in componentVersions:
+        if len(version) and version[0].isalpha():
+            componentVersions.remove(version)
+            componentVersions.insert(insertLocation , version)
+            insertLocation +=1
+
+    totalNumberVersions = len(componentVersions)
+
+    if totalNumberVersions > 0:
+        # There is at least one version available
+        try:
+            selectedVersionIndex = componentVersions.index(componentVersionName)
+            numberVersionsBack = totalNumberVersions-selectedVersionIndex - 1 # How far back from most recent release
+        except:
+            logger.error("    versionName %s is not a valid version for the component with ID %s" %(componentVersionName, componentID))
+            numberVersionsBack = -1
     
-    return operator.join(formatted_licenses)
+        componentVersionDetails["latestVersion"] = componentVersions[-1]
+        componentVersionDetails["numberVersionsBack"] = numberVersionsBack
 
-#-------------------------------------------------------
-def create_supplier_string(forge, componentName):
-
-
-    if forge in ["github", "gitlab"]:
-        # Is there a way to determine Person vs Organization?
-        supplier = "Organization: %s:%s" %(forge, componentName)
-    elif forge in ["other"]:
-        supplier = "Organization: Undetermined" 
     else:
-        if forge != "":
-            supplier = "Organization: %s:%s" %(forge, componentName)
-        else:
-            # Have a default value just in case one can't be created
-            supplier = "Organization: Undetermined" 
-   
-    return supplier
+        # The version that was selected must be in the ignoreVersions list above
+        componentVersionDetails["totalNumberVersions"] = 1
+        componentVersionDetails["latestVersion"] = componentVersionName
+        componentVersionDetails["numberVersionsBack"] = 0
+
+    
+    componentVersionDetails["currentVersion"] = componentVersionName
+  
+    logger.debug("        componentVersionDetails: %s" %componentVersionDetails)    
+
+    return componentVersionDetails
+
+#----------------------------------------------------------------------------------------#
+def roll_up_project_review_level(projectHierarchy, projectReviewStatus, recursionLevel):
+    recursionIndent = recursionLevel * " "
+    logger.debug("%s Entering roll_up_project_review_level" %recursionIndent)
+
+    parentProjectID = projectHierarchy['id']
+    parentProjectName = projectHierarchy['name']
+    parentProjectReviewStatus = projectReviewStatus[parentProjectID]
+
+    logger.debug("%s %s - Initial project review status: %s" %(recursionIndent, parentProjectName, parentProjectReviewStatus))
+
+    childProject = projectHierarchy["childProject"]
+
+    recursionLevel +=1
+    recursionIndent = recursionLevel * " "
+
+    for project in childProject:
+
+        # Get the most recent value for the parent project review status in case a child already changed it
+        parentProjectReviewStatus = projectReviewStatus[parentProjectID]
+      
+        projectReviewStatus = roll_up_project_review_level(project, projectReviewStatus, recursionLevel)
+
+        childProjectID = project["id"]
+        childProjectReviewSatus = projectReviewStatus[childProjectID]
+
+        logger.debug("%s %s - Current project review status: %s   Current child status:  %s" %(recursionIndent, parentProjectName, parentProjectReviewStatus, childProjectReviewSatus))
+
+        # Does the parent project status need to change to the a child project?
+        if childProjectReviewSatus == "Rejected":
+            logger.debug("        Change %s to rejected" %parentProjectName)
+            projectReviewStatus[parentProjectID] = "Rejected"
+        elif childProjectReviewSatus == "Draft" and parentProjectReviewStatus == "Approved":
+            logger.debug("        Change %s to draft" %parentProjectName)
+            projectReviewStatus[parentProjectID] = "Draft"
+
+    logger.debug("%s %s - Final project review status: %s" %(recursionIndent, parentProjectName, parentProjectReviewStatus))
+    
+    return projectReviewStatus
+
+#-----------------------------
+#  These two functions are used for naturally sorting the version names
+#  which was pulled from the web
+#  https://www.tutorialspoint.com/How-to-correctly-sort-a-string-with-a-number-inside-in-Python
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+def natural_sort(text):
+    return [ atoi(c) for c in re.split('(\d+)',text) ]
+
+    
