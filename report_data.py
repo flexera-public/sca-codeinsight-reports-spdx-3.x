@@ -106,7 +106,9 @@ def gather_data_for_report(projectID, reportData):
             inventoryAssociatedServerScannedFiles = report_data_db.get_server_scanned_files(projectID, inventoryID)
             if inventoryAssociatedServerScannedFiles is not None:
                 for inventoryAssociatedFile in inventoryAssociatedServerScannedFiles:
-                    fileHashes.append(inventoryAssociatedFile.get("fileSHA1"))
+                    fileSHA1 = inventoryAssociatedFile.get("fileSHA1")
+                    if fileSHA1:
+                        fileHashes.append(fileSHA1)
                     fileid = inventoryAssociatedFile['fileId']
                     fileName = inventoryAssociatedFile["filePath"].split("/")[-1]
                     file_spdx_id = f"{namespaceMap}ProjectId-{projectID}-FileId-{fileid}"
@@ -221,7 +223,9 @@ def gather_data_for_report(projectID, reportData):
             inventoryAssociatedRemoteScannedFiles = report_data_db.get_remote_scanned_files(projectID, inventoryID)
             if inventoryAssociatedRemoteScannedFiles is not None:
                 for inventoryAssociatedFile in inventoryAssociatedRemoteScannedFiles:
-                    fileHashes.append(inventoryAssociatedFile.get("fileSHA1"))
+                    fileSHA1 = inventoryAssociatedFile.get("fileSHA1")
+                    if fileSHA1:
+                        fileHashes.append(fileSHA1)
                     fileid = inventoryAssociatedFile['fileId']
                     fileName = inventoryAssociatedFile["filePath"].split("/")[-1]
                     file_spdx_id = f"{namespaceMap}ProjectId-{projectID}-FileId-{fileid}-remote"
@@ -258,13 +262,17 @@ def gather_data_for_report(projectID, reportData):
                     if rel_spdx_id not in added_spdx_ids:
                         reportDetails["@graph"].append(package_relationship_file_node)
                         added_spdx_ids.add(rel_spdx_id)
-            # Create a hash of the file hashes for PackageVerificationCode 
-            try:
-                stringHash = ''.join(sorted(fileHashes))
-            except:
-                logger.error("Failure sorting file hashes for %s" %inventoryItemName)
-                logger.debug(stringHash)
-                stringHash = ''.join(fileHashes)
+            # Create a hash of the file hashes for PackageVerificationCode
+            # Filter out any non-string / empty values defensively so we never
+            # attempt to join None into the SPDX verification code input.
+            validFileHashes = sorted(h for h in fileHashes if isinstance(h, str) and h)
+            if len(validFileHashes) != len(fileHashes):
+                logger.warning(
+                    "Skipped %d file(s) with missing SHA1 for inventory item %s",
+                    len(fileHashes) - len(validFileHashes),
+                    inventoryItemName,
+                )
+            stringHash = ''.join(validFileHashes)
             
             packageVerificationCodeValue = (hashlib.sha1(stringHash.encode('utf-8'))).hexdigest()
             
