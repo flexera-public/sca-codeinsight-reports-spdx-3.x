@@ -372,7 +372,41 @@ def gather_data_for_report(projectID, reportData):
             componentId = inventoryItem.get("componentId")
             declared_license_ids = []  # Track declared licenses for comparison
             
-            if componentId is not None:
+            licenseExpression = inventoryItem.get("licenseExpression")
+            licenseExpressionSource = inventoryItem.get("licenseExpressionSource")
+            
+            has_processed_declared_expression = False
+            if licenseExpression and str(licenseExpressionSource) in ('0', '2'):
+                logger.info(f"        Using license expression from scanner: {licenseExpression}")
+                license_expr_spdx_id = f"{namespaceMap}{projectID}-declared-{inventoryID}"
+                declared_license_ids.append(license_expr_spdx_id)
+                
+                if license_expr_spdx_id not in added_spdx_ids:
+                    license_expr_node = {
+                        "spdxId": license_expr_spdx_id,
+                        "type": "simplelicensing_LicenseExpression",
+                        "simplelicensing_licenseExpression": licenseExpression,
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(license_expr_node)
+                    added_spdx_ids.add(license_expr_spdx_id)
+                
+                declared_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-declared-{inventoryID}"
+                if declared_rel_spdx_id not in added_spdx_ids:
+                    declared_license_relationship_node = {
+                        "spdxId": declared_rel_spdx_id,
+                        "type": "Relationship",
+                        "relationshipType": "hasDeclaredLicense",
+                        "from": inventoryLink,
+                        "to": [license_expr_spdx_id],
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(declared_license_relationship_node)
+                    added_spdx_ids.add(declared_rel_spdx_id)
+                
+                has_processed_declared_expression = True
+            
+            if not has_processed_declared_expression and componentId is not None:
                 possibleLicenses = report_data_db.get_component_possible_Licenses(componentId)
                 if possibleLicenses is not None and isinstance(possibleLicenses, list) and len(possibleLicenses) > 0:
                     # Collect all declared license identifiers for potential OR expression
@@ -492,8 +526,53 @@ def gather_data_for_report(projectID, reportData):
             selectedLicenseSPDXIdentifier = inventoryItem.get("selectedLicenseSPDXIdentifier")
             shortName = inventoryItem.get("shortName")
             concluded_license_spdx_id = None  # Track for comparison with declared
-            
-            if selectedLicenseName is not None and selectedLicenseName != "":
+
+            # "I don't know" is a Code Insight sentinel selection meaning no license determination
+            # was made - it is not an actual license. When the inventory item already has a real
+            # declared license expression, skip emitting a hasConcludedLicense relationship for
+            # "I don't know" so we don't show a bogus concluded license alongside a known one.
+            is_unknown_selected_license = (
+                selectedLicenseName is not None and selectedLicenseName.strip().lower() == "i don't know"
+            )
+
+            if licenseExpression and str(licenseExpressionSource) == '1':
+                logger.info(f"        Using user-edited license expression as concluded: {licenseExpression}")
+                concluded_license_spdx_id = f"{namespaceMap}{projectID}-concluded-expr-{inventoryID}"
+                concluded_expression = licenseExpression
+                
+                if concluded_license_spdx_id not in added_spdx_ids:
+                    license_expr_node = {
+                        "spdxId": concluded_license_spdx_id,
+                        "type": "simplelicensing_LicenseExpression",
+                        "simplelicensing_licenseExpression": licenseExpression,
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(license_expr_node)
+                    added_spdx_ids.add(concluded_license_spdx_id)
+                
+                concluded_comment = None
+                if declared_license_ids and concluded_license_spdx_id not in declared_license_ids:
+                    concluded_comment = f"Concluded license expression '{concluded_expression}' provided by user edit."
+                
+                license_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-concluded-selected-{inventoryID}"
+                if license_rel_spdx_id not in added_spdx_ids:
+                    concluded_license_relationship_node = {
+                        "spdxId": license_rel_spdx_id,
+                        "type": "Relationship",
+                        "relationshipType": "hasConcludedLicense",
+                        "from": inventoryLink,
+                        "to": [concluded_license_spdx_id],
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    if concluded_comment:
+                        concluded_license_relationship_node["comment"] = concluded_comment
+                    reportDetails["@graph"].append(concluded_license_relationship_node)
+                    added_spdx_ids.add(license_rel_spdx_id)
+
+            elif is_unknown_selected_license and declared_license_ids:
+                logger.info("        Skipping hasConcludedLicense for selected license \"I don't know\" "
+                             "since a declared license expression already exists for this inventory item.")
+            elif selectedLicenseName is not None and selectedLicenseName != "":
                 # Determine the SPDX identifier to use
                 if selectedLicenseSPDXIdentifier is not None and selectedLicenseSPDXIdentifier != "":
                     selectedIdentifier = selectedLicenseSPDXIdentifier
