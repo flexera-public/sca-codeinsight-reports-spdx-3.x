@@ -94,6 +94,17 @@ def gather_data_for_report(projectID, reportData):
         inventoriesNotInRepo = report_data_db.get_inventories_not_in_repo(projectID)    # To handle WIP and License Only inventories
         inventoryItems += inventoriesNotInRepo
 
+        # Defensive de-dup: the standard and custom component queries can both return a row for
+        # the same inventory item. Collapse to one row per inventoryID, preferring whichever row
+        # carries the repository item's selected license expression.
+        deduped_inventory_items = {}
+        for item in inventoryItems:
+            key = item.get("inventoryID")
+            existing = deduped_inventory_items.get(key)
+            if existing is None or (item.get("licenseExpression") and not existing.get("licenseExpression")):
+                deduped_inventory_items[key] = item
+        inventoryItems = list(deduped_inventory_items.values())
+
         for inventoryItem in inventoryItems:
             fileHashes = []
             inventoryCopyrights = []  # Initialize inventory-level copyright collection
@@ -366,13 +377,65 @@ def gather_data_for_report(projectID, reportData):
                     reportDetails["@graph"].append(annotation_node)
                     added_spdx_ids.add(annotation_spdx_id)
 
+            # If PSE_LICENSE_EXPRESSION provides an authoritative license expression for this
+            # component version, emit a single license node + relationship based on its source
+            # (0/2 -> hasDeclaredLicense, 1 -> hasConcludedLicense) and skip the default
+            # declared/concluded processing to avoid emitting duplicate "I don't know" records.
+            licenseExpression = inventoryItem.get("licenseExpression")
+            licenseExpressionSource = inventoryItem.get("licenseExpressionSource")
+            try:
+                licenseExpressionSourceInt = int(licenseExpressionSource) if licenseExpressionSource is not None else None
+            except (TypeError, ValueError):
+                licenseExpressionSourceInt = None
+            use_pse_license_expression = (
+                licenseExpression is not None
+                and licenseExpression != ""
+                and licenseExpressionSourceInt in (0, 1, 2)
+            )
+
+            if use_pse_license_expression:
+                # PSE_LICENSE_EXPRESSION stores operands as raw PDL_LICENSE IDs
+                # (e.g. "28 OR 733 OR 1676").  Resolve them to short names before
+                # writing to the SPDX output.
+                licenseExpression = resolve_pse_license_expression(licenseExpression)
+                if licenseExpressionSourceInt == 1:
+                    pse_relationship_type = "hasConcludedLicense"
+                    pse_rel_kind = "concluded"
+                else:
+                    pse_relationship_type = "hasDeclaredLicense"
+                    pse_rel_kind = "declared"
+
+                pse_license_expr_spdx_id = f"{namespaceMap}{projectID}-{pse_rel_kind}-{inventoryID}"
+                if pse_license_expr_spdx_id not in added_spdx_ids:
+                    pse_license_expr_node = {
+                        "spdxId": pse_license_expr_spdx_id,
+                        "type": "simplelicensing_LicenseExpression",
+                        "simplelicensing_licenseExpression": licenseExpression,
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(pse_license_expr_node)
+                    added_spdx_ids.add(pse_license_expr_spdx_id)
+
+                pse_rel_spdx_id = f"{namespaceMap}{inventoryItemName}-{pse_rel_kind}-{inventoryID}"
+                if pse_rel_spdx_id not in added_spdx_ids:
+                    pse_license_relationship_node = {
+                        "spdxId": pse_rel_spdx_id,
+                        "type": "Relationship",
+                        "relationshipType": pse_relationship_type,
+                        "from": inventoryLink,
+                        "to": [pse_license_expr_spdx_id],
+                        "creationInfo": "_:creationInfo_0"
+                    }
+                    reportDetails["@graph"].append(pse_license_relationship_node)
+                    added_spdx_ids.add(pse_rel_spdx_id)
+
             # Process package-level licenses (declared licenses from component metadata)
             # Per SPDX 3.0.1: hasDeclaredLicense = license info found IN the package itself
             # (e.g., LICENSE file, README, package metadata, manifest files)
             componentId = inventoryItem.get("componentId")
             declared_license_ids = []  # Track declared licenses for comparison
-            
-            if componentId is not None:
+
+            if componentId is not None and not use_pse_license_expression:
                 possibleLicenses = report_data_db.get_component_possible_Licenses(componentId)
                 if possibleLicenses is not None and isinstance(possibleLicenses, list) and len(possibleLicenses) > 0:
                     # Collect all declared license identifiers for potential OR expression
@@ -493,7 +556,7 @@ def gather_data_for_report(projectID, reportData):
             shortName = inventoryItem.get("shortName")
             concluded_license_spdx_id = None  # Track for comparison with declared
             
-            if selectedLicenseName is not None and selectedLicenseName != "":
+            if selectedLicenseName is not None and selectedLicenseName != "" and not use_pse_license_expression:
                 # Determine the SPDX identifier to use
                 if selectedLicenseSPDXIdentifier is not None and selectedLicenseSPDXIdentifier != "":
                     selectedIdentifier = selectedLicenseSPDXIdentifier
@@ -837,6 +900,38 @@ def gather_data_for_report(projectID, reportData):
     reportData["reportDetails"] = reportDetails
     reportData["projectList"] = projectList
     return reportData
+
+#-------------------------------------------------------
+def resolve_pse_license_expression(license_expression):
+    """
+    Replace PDL_LICENSE IDs in a PSE license expression with short names while
+    preserving the operator stored in LICENSE_EXPRESSION_. For example,
+    ``28 OR 733`` remains an OR expression and ``28 AND 733`` remains an AND
+    expression after the IDs are resolved.
+
+    If a numeric ID cannot be resolved it is left as-is so the expression is
+    never silently truncated.
+    """
+    if not license_expression or not isinstance(license_expression, str):
+        return license_expression
+
+    # 1. Find all isolated digits, safely ignoring parentheses like "(28 OR 733)"
+    numeric_tokens = {int(x) for x in re.findall(r'\b\d+\b', license_expression)}
+
+    resolved = license_expression
+    if numeric_tokens:
+        id_to_name = report_data_db.get_license_short_names_for_ids(list(numeric_tokens))
+        # Replace each numeric token with its short name
+        resolved = re.sub(r'\b\d+\b', lambda m: id_to_name.get(int(m.group(0)), m.group(0)), resolved)
+
+    # 2. Normalize operators to uppercase (e.g., 'and' -> 'AND'), preserving structure
+    resolved = re.sub(r'\b(and|or)\b', lambda m: m.group(1).upper(), resolved, flags=re.IGNORECASE)
+
+    # Clean up any excessive spacing to keep the SPDX output tidy
+    resolved = " ".join(resolved.split())
+
+    logger.info("Resolved PSE license expression: %r -> %r", license_expression, resolved)
+    return resolved
 
 #-------------------------------------------------------
 def create_license_expression(licenses, use_or=True):
