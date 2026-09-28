@@ -10,11 +10,47 @@ Modified On: Oct Mon 07 2025
 File : report_data.py
 '''
 
-import logging, unicodedata, uuid, hashlib, datetime, re
+import logging, unicodedata, uuid, hashlib, datetime, re, json, os
 import report_data_db
 import SPDX_license_mappings
 
 logger = logging.getLogger(__name__)
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+
+class _StreamingGraphWriter:
+    """
+    Drop-in replacement for a plain list used as reportDetails["@graph"]. Supports
+    the same .append(node) call used at every call site in this file, but writes
+    each SPDX node straight to a temp file on disk instead of accumulating every
+    node in memory - avoids holding millions of node dicts in RAM for very large
+    scans (500k+ files / 20k+ inventories).
+    """
+    def __init__(self, context, temp_path):
+        self.temp_path = temp_path
+        self._file = open(temp_path, "w", encoding="utf-8")
+        self._first = True
+        self._file.write('{\n  "@context": %s,\n  "@graph": [\n' % json.dumps(context, ensure_ascii=False))
+
+    def append(self, node):
+        node_json = json.dumps(node, indent=2, ensure_ascii=False)
+        indented = "    " + node_json.replace("\n", "\n    ")
+        self._file.write(indented if self._first else ",\n" + indented)
+        self._first = False
+
+    def finalize(self):
+        self._file.write("\n  ]\n}\n")
+        self._file.close()
+        return self.temp_path
+
+    def __del__(self):
+        # Best-effort safety net if finalize() is never reached (e.g. an unhandled
+        # exception mid-report) - avoids leaking the underlying file handle.
+        try:
+            if self._file and not self._file.closed:
+                self._file.close()
+        except Exception:
+            pass
 #-------------------------------------------------------------------#
 def derive_cvss_severity(score):
     # Qualitative rating scale shared by CVSS v3.x and v4.0 (FIRST.org spec)
@@ -45,10 +81,12 @@ def gather_data_for_report(projectID, reportData):
     documentName = project_Name.replace(" ", "_")
     documentNamespace  = f"{namespaceMap}-{documentName}-{str(uuid.uuid1())}"
     
-    # SPDX 3.0.1 structure
+    # SPDX 3.0.1 structure - "@graph" streams straight to disk, see _StreamingGraphWriter
+    spdxContext = "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"
+    graphTempPath = os.path.join(SCRIPT_DIR, f"_spdx_graph_{projectID}_{uuid.uuid4().hex}.tmp.json")
     reportDetails = {
-        "@context": "https://spdx.org/rdf/3.0.1/spdx-context.jsonld",
-        "@graph": []
+        "@context": spdxContext,
+        "@graph": _StreamingGraphWriter(spdxContext, graphTempPath)
     }
     
     # Track added spdxIds to prevent duplicates
@@ -899,6 +937,7 @@ def gather_data_for_report(projectID, reportData):
     reportData["topLevelProjectName"] = topLevelProjectName
     reportData["reportDetails"] = reportDetails
     reportData["projectList"] = projectList
+    reportData["_graphFilePath"] = reportDetails["@graph"].finalize()
     return reportData
 
 #-------------------------------------------------------
