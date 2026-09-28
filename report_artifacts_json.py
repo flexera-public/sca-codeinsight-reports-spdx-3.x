@@ -7,7 +7,7 @@ Author : sgeary
 Created On : Fri Aug 18 2023
 File : report_artifacts_json.py
 '''
-import logging, json
+import logging, json, os, shutil
 logger = logging.getLogger(__name__)
 
 #--------------------------------------------------------------------------------#
@@ -16,14 +16,20 @@ def generate_json_report(reportData):
     logger.info("    Entering generate_json_report")
 
     reportFileNameBase = reportData["reportFileNameBase"]
-    reportDetails = reportData["reportDetails"]
-
     jsonFile = reportFileNameBase + ".spdx.json"
 
-    # Write the SPDX 3.0.1 JSON-LD structure
+    # The SPDX graph is streamed straight to a temp file as it's generated (see
+    # report_data.py._StreamingGraphWriter) to avoid holding every node in memory
+    # for very large scans; just move it into place under the final report name.
+    graphFilePath = reportData.get("_graphFilePath")
+
     try:
-        with open(jsonFile, "w", encoding="utf-8") as report_ptr:
-            json.dump(reportDetails, report_ptr, indent=2, ensure_ascii=False)
+        if graphFilePath and os.path.exists(graphFilePath):
+            shutil.move(graphFilePath, jsonFile)
+        else:
+            reportDetails = reportData["reportDetails"]
+            with open(jsonFile, "w", encoding="utf-8") as report_ptr:
+                json.dump(reportDetails, report_ptr, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"Failed to open file {jsonFile}: {e}")
         logger.error(f"Failed to open file {jsonFile}: {e}")

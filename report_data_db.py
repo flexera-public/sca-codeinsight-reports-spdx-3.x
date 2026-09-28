@@ -13,6 +13,7 @@ import threading
 import subprocess
 import logging
 import os
+import atexit
 import configparser
 import json
 from packaging.version import parse as parse_version
@@ -92,6 +93,12 @@ class InteractiveDbQueryRunner:
             raise
         
         self.lock = threading.Lock()
+
+        # Continuously drain stderr in the background. Without this, if the Java process
+        # ever writes enough to stderr to fill the OS pipe buffer, it blocks on that write
+        # and the whole query exchange deadlocks (stdout never advances either).
+        self._stderrThread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderrThread.start()
         
         # Try to set autocommit on
         try:
@@ -99,6 +106,15 @@ class InteractiveDbQueryRunner:
             logger.info("Set database autocommit to true")
         except Exception as e:
             logger.warning(f"Could not set autocommit mode: {e}")
+
+    def _drain_stderr(self):
+        try:
+            for line in iter(self.proc.stderr.readline, ""):
+                if not line:
+                    break
+                logger.warning("Java process stderr: %s", line.rstrip())
+        except (ValueError, OSError):
+            pass  # pipe/process closed during shutdown; nothing left to drain
 
     def run_query(self, sql_query):
         with self.lock:
@@ -133,6 +149,7 @@ class InteractiveDbQueryRunner:
                 logger.warning(f"Error terminating Java process: {e}")
             self.proc = None
 db_runner = InteractiveDbQueryRunner(JAR_PATH, JAVA_PATH)
+atexit.register(db_runner.close)  # ensure the Java helper process/DB connection is never orphaned
 
 
 def get_db_vendor():
